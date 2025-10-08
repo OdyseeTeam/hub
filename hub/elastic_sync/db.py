@@ -185,8 +185,16 @@ class ElasticSyncDB(SecondaryDB):
 
             if metadata.is_repost and reposted_duration is not None:
                 value['duration'] = reposted_duration
+                if reposted_metadata.stream.video and reposted_metadata.stream.video.height and reposted_metadata.stream.video.width:
+                    value['content_height'] = reposted_metadata.stream.video.height
+                    value['content_width'] = reposted_metadata.stream.video.width
+                    value['content_aspect_ratio'] = reposted_metadata.stream.video.width / reposted_metadata.stream.video.height
             elif metadata.is_stream and (metadata.stream.video.duration or metadata.stream.audio.duration):
                 value['duration'] = metadata.stream.video.duration or metadata.stream.audio.duration
+                if metadata.stream.video and metadata.stream.video.height and metadata.stream.video.width:
+                    value['content_height'] = metadata.stream.video.height
+                    value['content_width'] = metadata.stream.video.width
+                    value['content_aspect_ratio'] = metadata.stream.video.width / metadata.stream.video.height
             if metadata.is_stream:
                 value['release_time'] = metadata.stream.release_time or value['creation_timestamp']
             elif metadata.is_repost or metadata.is_collection:
@@ -228,3 +236,4 @@ class ElasticSyncDB(SecondaryDB):
             async for claim in self.prepare_claim_metadata_batch(claims, total_extras):
                 if claim:
                     yield claim
+                    

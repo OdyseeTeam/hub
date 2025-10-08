@@ -790,7 +790,7 @@ FIELDS = {
     'reposted_claim_id', 'repost_count', 'sd_hash',
     'trending_score', 'tx_num',
     'channel_tx_id', 'channel_tx_position', 'channel_height',  'reposted_tx_id',
-    'reposted_tx_position', 'reposted_height',
+    'reposted_tx_position', 'reposted_height', 'content_height', 'content_width', 'content_aspect_ratio',
 }
 
 TEXT_FIELDS = {
@@ -806,7 +806,7 @@ RANGE_FIELDS = {
     'tx_position', 'repost_count', 'limit_claims_per_channel',
     'amount', 'effective_amount', 'support_amount',
     'trending_score', 'censor_type', 'tx_num', 'reposted_tx_position', 'reposted_height',
-    'channel_tx_position', 'channel_height',
+    'channel_tx_position', 'channel_height', 'content_height', 'content_width', 'content_aspect_ratio',
 }
 
 ALL_FIELDS = RANGE_FIELDS | TEXT_FIELDS | FIELDS
