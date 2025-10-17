@@ -43,4 +43,9 @@ VOLUME $db_dir
 ENV DB_DIRECTORY=$db_dir
 
 COPY ./scripts/entrypoint.sh /entrypoint.sh
-ENTRYPOINT ["/entrypoint.sh"]
+# Normalize line endings and ensure executable bit (handles Windows CRLF builds)
+USER root
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+USER $user
+# Use bash to avoid shebang issues when building on Windows
+ENTRYPOINT ["bash", "/entrypoint.sh"]
