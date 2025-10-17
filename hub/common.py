@@ -837,6 +837,7 @@ def expand_query(filter_first=False, max_terms_per_clause=2048, **kwargs):
     if kwargs.get('is_controlling') is False:
         kwargs.pop('is_controlling')
     query = {'must': [], 'must_not': [], 'filter': []}
+    target = 'filter' if filter_first else 'must'
     collapse = None
     if 'fee_currency' in kwargs and kwargs['fee_currency'] is not None:
         kwargs['fee_currency'] = kwargs['fee_currency'].upper()
@@ -872,7 +873,6 @@ def expand_query(filter_first=False, max_terms_per_clause=2048, **kwargs):
             if key in TEXT_FIELDS:
                 key += '.keyword'
             ops = {'<=': 'lte', '>=': 'gte', '<': 'lt', '>': 'gt'}
-            target = 'filter' if filter_first else 'must'
             if partial_id:
                 query[target].append({"prefix": {key: value}})
             elif key in RANGE_FIELDS and isinstance(value, str) and value[0] in ops:
@@ -924,28 +924,20 @@ def expand_query(filter_first=False, max_terms_per_clause=2048, **kwargs):
                 query['must_not'].append({"term": {'channel_id.keyword': channel_id}})
                 query['must_not'].append({"term": {'_id': channel_id}})
         elif key == 'channel_ids':
-            target = 'filter' if filter_first else 'must'
             query[target].append({"terms": {'channel_id.keyword': value}})
         elif key == 'claim_ids':
-            target = 'filter' if filter_first else 'must'
             query[target].append({"terms": {'claim_id.keyword': value}})
         elif key == 'media_types':
-            target = 'filter' if filter_first else 'must'
             query[target].append({"terms": {'media_type.keyword': value}})
         elif key == 'any_languages':
-            target = 'filter' if filter_first else 'must'
             query[target].append({"terms": {'languages': clean_tags(value)}})
         elif key == 'any_languages':
-            target = 'filter' if filter_first else 'must'
             query[target].append({"terms": {'languages': value}})
         elif key == 'all_languages':
-            target = 'filter' if filter_first else 'must'
             query[target].extend([{"term": {'languages': tag}} for tag in value])
         elif key == 'any_tags':
-            target = 'filter' if filter_first else 'must'
             query[target].append({"terms": {'tags.keyword': clean_tags(value)}})
         elif key == 'all_tags':
-            target = 'filter' if filter_first else 'must'
             query[target].extend([{"term": {'tags.keyword': tag}} for tag in clean_tags(value)])
         elif key == 'not_tags':
             query['must_not'].extend([{"term": {'tags.keyword': tag}} for tag in clean_tags(value)])
@@ -953,7 +945,6 @@ def expand_query(filter_first=False, max_terms_per_clause=2048, **kwargs):
             query['must_not'].extend([{"term": {'claim_id.keyword': cid}} for cid in value])
         elif key == 'limit_claims_per_channel':
             collapse = ('channel_id.keyword', value)
-    target = 'filter' if filter_first else 'must'
     if kwargs.get('has_channel_signature'):
         query[target].append({"exists": {"field": "signature"}})
         if 'signature_valid' in kwargs:
