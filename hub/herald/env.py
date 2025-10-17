@@ -27,7 +27,8 @@ class ServerEnv(Env):
                  database_query_timeout=None, blocking_channel_ids=None, filtering_channel_ids=None, peer_hubs=None,
                  peer_announce=None, index_address_status=None, address_history_cache_size=None, daemon_ca_path=None,
                  merkle_cache_size=None, resolved_url_cache_size=None, tx_cache_size=None,
-                 history_tx_cache_size=None, largest_address_history_cache_size=None):
+                 history_tx_cache_size=None, largest_address_history_cache_size=None,
+                 filter_first_queries=None, es_profile_sample_rate=None, max_terms_per_clause=None):
         super().__init__(db_dir, max_query_workers, chain, reorg_limit, prometheus_port, cache_all_tx_hashes,
                          blocking_channel_ids, filtering_channel_ids, index_address_status)
         self.daemon_url = daemon_url if daemon_url is not None else self.required('DAEMON_URL')
@@ -74,6 +75,12 @@ class ServerEnv(Env):
             'TX_CACHE_SIZE', 32768)
         self.history_tx_cache_size = history_tx_cache_size if history_tx_cache_size is not None else \
             self.integer('HISTORY_TX_CACHE_SIZE', 4194304)
+        self.filter_first_queries = filter_first_queries if filter_first_queries is not None else \
+            self.boolean('FILTER_FIRST_QUERIES', False)
+        self.es_profile_sample_rate = es_profile_sample_rate if es_profile_sample_rate is not None else \
+            float(self.default('ES_PROFILE_SAMPLE_RATE', '0.0'))
+        self.max_terms_per_clause = max_terms_per_clause if max_terms_per_clause is not None else \
+            self.integer('MAX_TERMS_PER_CLAUSE', 2048)
 
     @classmethod
     def contribute_to_arg_parser(cls, parser):
@@ -144,6 +151,18 @@ class ServerEnv(Env):
                             default=cls.integer('HISTORY_TX_CACHE_SIZE', 524288),
                             help="Size of the lfu cache of txids in transaction histories for addresses. "
                                  "Can be set in the env with 'HISTORY_TX_CACHE_SIZE'")
+        parser.add_argument('--filter_first_queries', action='store_true',
+                            help="Enable filter-first query optimization for Elasticsearch. "
+                                 "Can be set in the env with 'FILTER_FIRST_QUERIES'",
+                            default=cls.boolean('FILTER_FIRST_QUERIES', False))
+        parser.add_argument('--es_profile_sample_rate', type=float,
+                            default=float(cls.default('ES_PROFILE_SAMPLE_RATE', '0.0')),
+                            help="Percentage (0.0-1.0) of ES queries to profile and log. "
+                                 "Can be set in the env with 'ES_PROFILE_SAMPLE_RATE'")
+        parser.add_argument('--max_terms_per_clause', type=int,
+                            default=cls.integer('MAX_TERMS_PER_CLAUSE', 2048),
+                            help="Maximum number of terms allowed in a single Elasticsearch terms clause. "
+                                 "Can be set in the env with 'MAX_TERMS_PER_CLAUSE'")
 
     @classmethod
     def from_arg_parser(cls, args):
@@ -162,5 +181,7 @@ class ServerEnv(Env):
             address_history_cache_size=args.address_history_cache_size, daemon_ca_path=args.daemon_ca_path,
             merkle_cache_size=args.merkle_cache_size, resolved_url_cache_size=args.resolved_url_cache_size,
             tx_cache_size=args.tx_cache_size, history_tx_cache_size=args.history_tx_cache_size,
-            largest_address_history_cache_size=args.largest_address_history_cache_size
+            largest_address_history_cache_size=args.largest_address_history_cache_size,
+            filter_first_queries=args.filter_first_queries, es_profile_sample_rate=args.es_profile_sample_rate,
+            max_terms_per_clause=args.max_terms_per_clause
         )

@@ -4,13 +4,16 @@ from bisect import bisect_right
 from collections import Counter, deque
 from operator import itemgetter
 from typing import Optional, List, TYPE_CHECKING, Deque, Tuple
+import random
 
 from elasticsearch import AsyncElasticsearch, NotFoundError, ConnectionError
+from prometheus_client import Histogram, Counter as PrometheusCounter
+from hub import PROMETHEUS_NAMESPACE
+from hub.common import HISTOGRAM_BUCKETS
 from hub.schema.result import Censor, Outputs
 from hub.common import LRUCache, IndexVersionMismatch, INDEX_DEFAULT_SETTINGS, expand_query, expand_result
 from hub.db.common import ResolveResult
 if TYPE_CHECKING:
-    from prometheus_client import Counter as PrometheusCounter
     from hub.db import SecondaryDB
 
 
@@ -26,12 +29,25 @@ class StreamResolution(str):
         return LookupError(f'Could not find claim at "{url}".')
 
 
+NAMESPACE = f"{PROMETHEUS_NAMESPACE}_search"
+
+
 class SearchIndex:
     VERSION = 1
 
+    es_query_time_metric = Histogram(
+        "es_query_seconds", "Elasticsearch query execution time in seconds",
+        namespace=NAMESPACE, buckets=HISTOGRAM_BUCKETS
+    )
+    es_query_failure_metric = PrometheusCounter(
+        "es_query_failures", "Number of Elasticsearch query failures",
+        namespace=NAMESPACE
+    )
+
     def __init__(self, hub_db: 'SecondaryDB', index_prefix: str, search_timeout=3.0,
                  elastic_services: Optional[Deque[Tuple[Tuple[str, int], Tuple[str, int]]]] = None,
-                 timeout_counter: Optional['PrometheusCounter'] = None):
+                 timeout_counter: Optional['PrometheusCounter'] = None,
+                 filter_first_queries=False, es_profile_sample_rate=0.0, max_terms_per_clause=2048):
         self.hub_db = hub_db
         self.search_timeout = search_timeout
         self.timeout_counter: Optional['PrometheusCounter'] = timeout_counter
@@ -44,6 +60,9 @@ class SearchIndex:
         self.search_cache = LRUCache(2 ** 17)
         self._elastic_services = elastic_services
         self.lost_connection = asyncio.Event()
+        self.filter_first_queries = filter_first_queries
+        self.es_profile_sample_rate = es_profile_sample_rate
+        self.max_terms_per_clause = max_terms_per_clause
 
     async def get_index_version(self) -> int:
         try:
@@ -207,12 +226,27 @@ class SearchIndex:
                 if cache_item.result:
                     reordered_hits = cache_item.result
                 else:
-                    query = expand_query(**kwargs)
-                    es_resp = await self.search_client.search(
-                        query, index=self.index, track_total_hits=False,
-                        timeout=f'{int(1000*self.search_timeout)}ms',
-                        _source_includes=['_id', 'channel_id', 'reposted_claim_id', 'creation_height']
+                    should_profile = random.random() < self.es_profile_sample_rate
+                    query = expand_query(
+                        filter_first=self.filter_first_queries,
+                        max_terms_per_clause=self.max_terms_per_clause,
+                        **kwargs
                     )
+                    if should_profile:
+                        query['profile'] = True
+                    try:
+                        es_resp = await self.search_client.search(
+                            query, index=self.index, track_total_hits=False,
+                            timeout=f'{int(1000*self.search_timeout)}ms',
+                            _source_includes=['_id', 'channel_id', 'reposted_claim_id', 'creation_height']
+                        )
+                        self.es_query_time_metric.observe(es_resp.get('took', 0) / 1000.0)
+                        if should_profile and 'profile' in es_resp:
+                            self.logger.info("ES query profile (filter_first=%s): %s", self.filter_first_queries, es_resp.get('profile'))
+                    except Exception as e:
+                        self.es_query_failure_metric.inc()
+                        self.logger.exception("ES query failed: %s", e)
+                        raise
                     search_hits = deque(es_resp['hits']['hits'])
                     if self.timeout_counter and es_resp['timed_out']:
                         self.timeout_counter.inc()

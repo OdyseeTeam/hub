@@ -827,7 +827,7 @@ REPLACEMENTS = {
 }
 
 
-def expand_query(**kwargs):
+def expand_query(filter_first=False, max_terms_per_clause=2048, **kwargs):
     if "amount_order" in kwargs:
         kwargs["limit"] = 1
         kwargs["order_by"] = "effective_amount"
@@ -836,15 +836,15 @@ def expand_query(**kwargs):
         kwargs['name'] = normalize_name(kwargs.pop('name'))
     if kwargs.get('is_controlling') is False:
         kwargs.pop('is_controlling')
-    query = {'must': [], 'must_not': []}
+    query = {'must': [], 'must_not': [], 'filter': []}
     collapse = None
     if 'fee_currency' in kwargs and kwargs['fee_currency'] is not None:
         kwargs['fee_currency'] = kwargs['fee_currency'].upper()
     for key, value in kwargs.items():
         key = key.replace('claim.', '')
         many = key.endswith('__in') or isinstance(value, list)
-        if many and len(value) > 2048:
-            raise TooManyClaimSearchParametersError(key, 2048)
+        if many and len(value) > max_terms_per_clause:
+            raise TooManyClaimSearchParametersError(key, max_terms_per_clause)
         if many:
             key = key.replace('__in', '')
             value = list(filter(None, value))
@@ -872,14 +872,15 @@ def expand_query(**kwargs):
             if key in TEXT_FIELDS:
                 key += '.keyword'
             ops = {'<=': 'lte', '>=': 'gte', '<': 'lt', '>': 'gt'}
+            target = 'filter' if filter_first else 'must'
             if partial_id:
-                query['must'].append({"prefix": {key: value}})
+                query[target].append({"prefix": {key: value}})
             elif key in RANGE_FIELDS and isinstance(value, str) and value[0] in ops:
                 operator_length = 2 if value[:2] in ops else 1
                 operator, value = value[:operator_length], value[operator_length:]
                 if key == 'fee_amount':
                     value = str(Decimal(value)*1000)
-                query['must'].append({"range": {key: {ops[operator]: value}}})
+                query[target].append({"range": {key: {ops[operator]: value}}})
             elif key in RANGE_FIELDS and isinstance(value, list) and all(v[0] in ops for v in value):
                 range_constraints = []
                 release_times = []
@@ -893,104 +894,107 @@ def expand_query(**kwargs):
                     else:
                         range_constraints.append((operator, stripped_op_v))
                 if key != 'release_time':
-                    query['must'].append({"range": {key: {ops[operator]: v for operator, v in range_constraints}}})
+                    query[target].append({"range": {key: {ops[operator]: v for operator, v in range_constraints}}})
                 else:
-                    query['must'].append(
+                    query[target].append(
                         {"bool":
                             {"should": [
                                 {"bool": {
                                     "must_not": {
-                                        "exists": {
-                                            "field": "release_time"
-                                        }
+                                        "exists": {"field": "release_time"}
                                     }
                                 }},
                                 {"bool": {
                                     "must": [
                                         {"exists": {"field": "release_time"}},
-                                        {'range': {key: {ops[operator]: v for operator, v in release_times}}},
-                                ]}},
+                                        {"range": {key: {ops[operator]: v for operator, v in release_times}}},
+                                    ]
+                                }}
                             ]}
                         }
                     )
             elif many:
-                query['must'].append({"terms": {key: value}})
+                query[target].append({"terms": {key: value}})
             else:
                 if key == 'fee_amount':
                     value = str(Decimal(value)*1000)
-                query['must'].append({"term": {key: {"value": value}}})
+                query[target].append({"term": {key: {"value": value}}})
         elif key == 'not_channel_ids':
             for channel_id in value:
                 query['must_not'].append({"term": {'channel_id.keyword': channel_id}})
                 query['must_not'].append({"term": {'_id': channel_id}})
         elif key == 'channel_ids':
-            query['must'].append({"terms": {'channel_id.keyword': value}})
+            target = 'filter' if filter_first else 'must'
+            query[target].append({"terms": {'channel_id.keyword': value}})
         elif key == 'claim_ids':
-            query['must'].append({"terms": {'claim_id.keyword': value}})
+            target = 'filter' if filter_first else 'must'
+            query[target].append({"terms": {'claim_id.keyword': value}})
         elif key == 'media_types':
-            query['must'].append({"terms": {'media_type.keyword': value}})
+            target = 'filter' if filter_first else 'must'
+            query[target].append({"terms": {'media_type.keyword': value}})
         elif key == 'any_languages':
-            query['must'].append({"terms": {'languages': clean_tags(value)}})
+            target = 'filter' if filter_first else 'must'
+            query[target].append({"terms": {'languages': clean_tags(value)}})
         elif key == 'any_languages':
-            query['must'].append({"terms": {'languages': value}})
+            target = 'filter' if filter_first else 'must'
+            query[target].append({"terms": {'languages': value}})
         elif key == 'all_languages':
-            query['must'].extend([{"term": {'languages': tag}} for tag in value])
+            target = 'filter' if filter_first else 'must'
+            query[target].extend([{"term": {'languages': tag}} for tag in value])
         elif key == 'any_tags':
-            query['must'].append({"terms": {'tags.keyword': clean_tags(value)}})
+            target = 'filter' if filter_first else 'must'
+            query[target].append({"terms": {'tags.keyword': clean_tags(value)}})
         elif key == 'all_tags':
-            query['must'].extend([{"term": {'tags.keyword': tag}} for tag in clean_tags(value)])
+            target = 'filter' if filter_first else 'must'
+            query[target].extend([{"term": {'tags.keyword': tag}} for tag in clean_tags(value)])
         elif key == 'not_tags':
             query['must_not'].extend([{"term": {'tags.keyword': tag}} for tag in clean_tags(value)])
         elif key == 'not_claim_id':
             query['must_not'].extend([{"term": {'claim_id.keyword': cid}} for cid in value])
         elif key == 'limit_claims_per_channel':
             collapse = ('channel_id.keyword', value)
+    target = 'filter' if filter_first else 'must'
     if kwargs.get('has_channel_signature'):
-        query['must'].append({"exists": {"field": "signature"}})
+        query[target].append({"exists": {"field": "signature"}})
         if 'signature_valid' in kwargs:
-            query['must'].append({"term": {"is_signature_valid": bool(kwargs["signature_valid"])}})
+            query[target].append({"term": {"is_signature_valid": bool(kwargs["signature_valid"])}})
     elif 'signature_valid' in kwargs:
-        query['must'].append(
+        query[target].append(
             {"bool":
                 {"should": [
                     {"bool": {"must_not": {"exists": {"field": "signature"}}}},
-                    {"bool" : {"must" : {"term": {"is_signature_valid": bool(kwargs["signature_valid"])}}}}
+                    {"bool": {"must": {"term": {"is_signature_valid": bool(kwargs["signature_valid"])}}}}
                 ]}
              }
         )
     if 'has_source' in kwargs:
         is_stream_or_repost_terms = {"terms": {"claim_type": [CLAIM_TYPES['stream'], CLAIM_TYPES['repost']]}}
-        query['must'].append(
-            {"bool":
-                {"should": [
-                    {"bool": # when is_stream_or_repost AND has_source
-                        {"must": [
+        query[target].append(
+            {"bool": {
+                "should": [
+                    {"bool": {
+                        "must": [
                             {"match": {"has_source": kwargs['has_source']}},
                             is_stream_or_repost_terms,
                         ]
-                        },
-                     },
-                    {"bool": # when not is_stream_or_repost
-                        {"must_not": is_stream_or_repost_terms}
-                     },
-                    {"bool": # when reposted_claim_type wouldn't have source
-                        {"must_not":
-                            [
-                                {"term": {"reposted_claim_type": CLAIM_TYPES['stream']}}
-                            ],
-                        "must":
-                            [
-                                {"term": {"claim_type": CLAIM_TYPES['repost']}}
-                            ]
-                        }
-                     }
-                ]}
-             }
+                    }},
+                    {"bool": {
+                        "must_not": is_stream_or_repost_terms
+                    }},
+                    {"bool": {
+                        "must_not": [{"term": {"reposted_claim_type": CLAIM_TYPES['stream']}}],
+                        "must": [{"term": {"claim_type": CLAIM_TYPES['repost']}}]
+                    }}
+                ]
+            }}
         )
     if kwargs.get('text'):
+        text_query = kwargs["text"]
+        if text_query.startswith('*') or text_query.startswith('?'):
+            raise ValueError('Leading wildcards are not allowed in text queries')
         query['must'].append(
                     {"simple_query_string":
-                         {"query": kwargs["text"], "fields": [
+                         {"query": text_query, "fields": [
                              "claim_name^4", "channel_name^8", "title^1", "description^.5", "author^1", "tags^.5"
                          ]}})
     query = {

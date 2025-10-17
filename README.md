@@ -105,6 +105,9 @@ For various reasons it may be desirable to block or filtering content from claim
   - `--blocking_channel_ids` Space separated list of channel claim ids used for blocking. Claims that are reposted by these channels can't be resolved or returned in search results. Can be set from the environment with `BLOCKING_CHANNEL_IDS`.
   - `--filtering_channel_ids` Space separated list of channel claim ids used for blocking. Claims that are reposted by these channels aren't returned in search results. Can be set from the environment with `FILTERING_CHANNEL_IDS`
   - `--index_address_statuses` Use the address history status index, this makes handling notifications for transactions in a block uniformly fast (must be turned on in `scribe` too).
+  - `--filter_first_queries` Enable filter-first query optimization for Elasticsearch (reduces CPU and improves query performance). Defaults to off. Can be set from the environment with `FILTER_FIRST_QUERIES=Yes`
+  - `--es_profile_sample_rate` Percentage (0.0-1.0) of ES queries to profile and log for performance analysis. Defaults to 0.0. Can be set from the environment with `ES_PROFILE_SAMPLE_RATE`
+  - `--max_terms_per_clause` Maximum number of terms allowed in a single Elasticsearch terms clause (prevents query explosions). Defaults to 2048. Can be set from the environment with `MAX_TERMS_PER_CLAUSE`
 
 ## Contributing
 

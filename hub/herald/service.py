@@ -32,7 +32,10 @@ class HubServerService(BlockchainReaderService):
         self.search_index = SearchIndex(
             self.db, self.env.es_index_prefix, self.env.database_query_timeout,
             elastic_services=self.env.elastic_services,
-            timeout_counter=self.interrupt_count_metric
+            timeout_counter=self.interrupt_count_metric,
+            filter_first_queries=self.env.filter_first_queries,
+            es_profile_sample_rate=self.env.es_profile_sample_rate,
+            max_terms_per_clause=self.env.max_terms_per_clause
         )
 
         self.session_manager = SessionManager(
