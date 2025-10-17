@@ -37,7 +37,7 @@ class TestExpandQuery(unittest.TestCase):
         self.assertIn('Leading wildcards are not allowed', str(context.exception))
 
     def test_max_terms_per_clause_enforced(self):
-        too_many = ['id' + str(i) for i in range(2001)]
+        too_many = ['id' + str(i) for i in range(2049)]
         with self.assertRaises(TooManyClaimSearchParametersError):
             expand_query(max_terms_per_clause=2048, claim_ids=too_many)
 
