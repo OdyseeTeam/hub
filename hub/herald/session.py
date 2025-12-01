@@ -1266,8 +1266,11 @@ class LBRYElectrumX(asyncio.Protocol):
             release_times = release_time if isinstance(release_time, list) else [release_time]
             try:
                 kwargs['release_time'] = [format_release_time(release_time) for release_time in release_times]
-            except ValueError:
-                pass
+            except ValueError as e:
+                # Log invalid release_time and return error to client
+                self.logger.warning("Invalid release_time parameter from %s: %s",
+                                   self.peer_address()[0] if self.peer_address() else 'unknown', str(e))
+                raise RPCError(BAD_REQUEST, f'invalid release_time parameter: {str(e)}')
         try:
             self.session_manager.pending_query_metric.inc()
             if 'channel' in kwargs:
@@ -1812,8 +1815,18 @@ def format_release_time(release_time):
     def roundup_time(number, factor=360):
         return int(1 + int(number / factor)) * factor
     if isinstance(release_time, str) and len(release_time) > 0:
+        # Validate string length to prevent DoS with extremely long inputs
+        if len(release_time) > 100:
+            raise ValueError(f'release_time string too long: {len(release_time)} characters')
         time_digits = ''.join(filter(str.isdigit, release_time))
+        # Validate that we have digits and they form a reasonable number
+        if not time_digits:
+            raise ValueError('release_time must contain digits')
+        if len(time_digits) > 20:  # Unix timestamps are ~10 digits, give generous buffer
+            raise ValueError(f'release_time contains too many digits: {len(time_digits)}')
         time_prefix = release_time[:-len(time_digits)]
         return time_prefix + str(roundup_time(int(time_digits)))
     elif isinstance(release_time, int):
         return roundup_time(release_time)
+    else:
+        raise ValueError(f'release_time must be a string or int, got {type(release_time).__name__}')

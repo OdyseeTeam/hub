@@ -840,8 +840,26 @@ def expand_query(**kwargs):
     collapse = None
     if 'fee_currency' in kwargs and kwargs['fee_currency'] is not None:
         kwargs['fee_currency'] = kwargs['fee_currency'].upper()
+
+    def wrap_range_with_missing(field, range_clause):
+        return {
+            "bool": {
+                "should": [
+                    {"bool": {"must_not": {"exists": {"field": field}}}},
+                    {"bool": {"must": [{"exists": {"field": field}}, range_clause]}},
+                ]
+            }
+        }
+
     for key, value in kwargs.items():
         key = key.replace('claim.', '')
+        include_missing = False
+        if key.endswith('__or_missing'):
+            include_missing = True
+            key = key[:-len('__or_missing')]
+        elif key.endswith('_or_missing'):
+            include_missing = True
+            key = key[:-len('_or_missing')]
         many = key.endswith('__in') or isinstance(value, list)
         if many and len(value) > 2048:
             raise TooManyClaimSearchParametersError(key, 2048)
@@ -879,7 +897,10 @@ def expand_query(**kwargs):
                 operator, value = value[:operator_length], value[operator_length:]
                 if key == 'fee_amount':
                     value = str(Decimal(value)*1000)
-                query['must'].append({"range": {key: {ops[operator]: value}}})
+                range_clause = {"range": {key: {ops[operator]: value}}}
+                if include_missing:
+                    range_clause = wrap_range_with_missing(key, range_clause)
+                query['must'].append(range_clause)
             elif key in RANGE_FIELDS and isinstance(value, list) and all(v[0] in ops for v in value):
                 range_constraints = []
                 release_times = []
@@ -893,26 +914,13 @@ def expand_query(**kwargs):
                     else:
                         range_constraints.append((operator, stripped_op_v))
                 if key != 'release_time':
-                    query['must'].append({"range": {key: {ops[operator]: v for operator, v in range_constraints}}})
+                    range_clause = {"range": {key: {ops[operator]: v for operator, v in range_constraints}}}
+                    if include_missing:
+                        range_clause = wrap_range_with_missing(key, range_clause)
+                    query['must'].append(range_clause)
                 else:
-                    query['must'].append(
-                        {"bool":
-                            {"should": [
-                                {"bool": {
-                                    "must_not": {
-                                        "exists": {
-                                            "field": "release_time"
-                                        }
-                                    }
-                                }},
-                                {"bool": {
-                                    "must": [
-                                        {"exists": {"field": "release_time"}},
-                                        {'range': {key: {ops[operator]: v for operator, v in release_times}}},
-                                ]}},
-                            ]}
-                        }
-                    )
+                    range_clause = {"range": {key: {ops[operator]: v for operator, v in release_times}}}
+                    query['must'].append(wrap_range_with_missing(key, range_clause))
             elif many:
                 query['must'].append({"terms": {key: value}})
             else:
@@ -954,38 +962,30 @@ def expand_query(**kwargs):
             {"bool":
                 {"should": [
                     {"bool": {"must_not": {"exists": {"field": "signature"}}}},
-                    {"bool" : {"must" : {"term": {"is_signature_valid": bool(kwargs["signature_valid"])}}}}
+                    {"bool": {"must": {"term": {"is_signature_valid": bool(kwargs["signature_valid"])}}}}
                 ]}
              }
         )
     if 'has_source' in kwargs:
         is_stream_or_repost_terms = {"terms": {"claim_type": [CLAIM_TYPES['stream'], CLAIM_TYPES['repost']]}}
         query['must'].append(
-            {"bool":
-                {"should": [
-                    {"bool": # when is_stream_or_repost AND has_source
-                        {"must": [
+            {"bool": {
+                "should": [
+                    {"bool": {
+                        "must": [
                             {"match": {"has_source": kwargs['has_source']}},
                             is_stream_or_repost_terms,
                         ]
-                        },
-                     },
-                    {"bool": # when not is_stream_or_repost
-                        {"must_not": is_stream_or_repost_terms}
-                     },
-                    {"bool": # when reposted_claim_type wouldn't have source
-                        {"must_not":
-                            [
-                                {"term": {"reposted_claim_type": CLAIM_TYPES['stream']}}
-                            ],
-                        "must":
-                            [
-                                {"term": {"claim_type": CLAIM_TYPES['repost']}}
-                            ]
-                        }
-                     }
-                ]}
-             }
+                    }},
+                    {"bool": {
+                        "must_not": is_stream_or_repost_terms
+                    }},
+                    {"bool": {
+                        "must_not": [{"term": {"reposted_claim_type": CLAIM_TYPES['stream']}}],
+                        "must": [{"term": {"claim_type": CLAIM_TYPES['repost']}}]
+                    }}
+                ]
+            }}
         )
     if kwargs.get('text'):
         query['must'].append(
