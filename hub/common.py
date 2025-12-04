@@ -838,6 +838,8 @@ def expand_query(**kwargs):
         kwargs.pop('is_controlling')
     query = {'must': [], 'must_not': []}
     collapse = None
+    shorts_aspect_ratio_lte = kwargs.pop('exclude_shorts_aspect_ratio_lte', 0.95)
+    shorts_duration_lte = kwargs.pop('exclude_shorts_duration_lte', 180)
     if 'fee_currency' in kwargs and kwargs['fee_currency'] is not None:
         kwargs['fee_currency'] = kwargs['fee_currency'].upper()
 
@@ -953,6 +955,18 @@ def expand_query(**kwargs):
             query['must_not'].extend([{"term": {'claim_id.keyword': cid}} for cid in value])
         elif key == 'limit_claims_per_channel':
             collapse = ('channel_id.keyword', value)
+        elif key == 'exclude_shorts' and value:
+            # exclude content that matches our shorts definition: portrait-ish aspect and short duration
+            query['must_not'].append({
+                "bool": {
+                    "must": [
+                        {"exists": {"field": "content_aspect_ratio"}},
+                        {"exists": {"field": "duration"}},
+                        {"range": {"content_aspect_ratio": {"lte": shorts_aspect_ratio_lte}}},
+                        {"range": {"duration": {"lte": shorts_duration_lte}}},
+                    ]
+                }
+            })
     if kwargs.get('has_channel_signature'):
         query['must'].append({"exists": {"field": "signature"}})
         if 'signature_valid' in kwargs:
