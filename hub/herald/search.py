@@ -193,12 +193,12 @@ class SearchIndex:
         # return expand_result(result['hits']), 0, result.get('total', {}).get('value', 0)
 
     async def search_ahead(self, **kwargs):
-        # 'limit_claims_per_channel' case. Fetch 1000 results, reorder, slice, inflate and return
+        # 'limit_claims_per_channel' case. Fetch 10000 results, reorder, slice, inflate and return
         per_channel_per_page = kwargs.pop('limit_claims_per_channel', 0) or 0
         remove_duplicates = kwargs.pop('remove_duplicates', False)
         page_size = kwargs.pop('limit', 10)
         offset = kwargs.pop('offset', 0)
-        kwargs['limit'] = 1000
+        kwargs['limit'] = 10000
         cache_item = ResultCacheItem.from_cache(f"ahead{per_channel_per_page}{kwargs}", self.search_cache)
         if cache_item.result is not None:
             reordered_hits = cache_item.result
