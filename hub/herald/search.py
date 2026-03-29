@@ -1,16 +1,25 @@
-import logging
 import asyncio
+import logging
 from bisect import bisect_right
 from collections import Counter, deque
 from operator import itemgetter
-from typing import Optional, List, TYPE_CHECKING, Deque, Tuple
+from typing import TYPE_CHECKING, Deque, List, Optional, Tuple
 
-from elasticsearch import AsyncElasticsearch, NotFoundError, ConnectionError
-from hub.schema.result import Censor, Outputs
-from hub.common import LRUCache, IndexVersionMismatch, INDEX_DEFAULT_SETTINGS, expand_query, expand_result
+from elasticsearch import AsyncElasticsearch, ConnectionError, NotFoundError
+
+from hub.common import (
+    INDEX_DEFAULT_SETTINGS,
+    IndexVersionMismatch,
+    LRUCache,
+    expand_query,
+    expand_result,
+)
 from hub.db.common import ResolveResult
+from hub.schema.result import Censor, Outputs
+
 if TYPE_CHECKING:
     from prometheus_client import Counter as PrometheusCounter
+
     from hub.db import SecondaryDB
 
 
@@ -29,56 +38,80 @@ class StreamResolution(str):
 class SearchIndex:
     VERSION = 1
 
-    def __init__(self, hub_db: 'SecondaryDB', index_prefix: str, search_timeout=3.0,
-                 elastic_services: Optional[Deque[Tuple[Tuple[str, int], Tuple[str, int]]]] = None,
-                 timeout_counter: Optional['PrometheusCounter'] = None):
+    def __init__(
+        self,
+        hub_db: "SecondaryDB",
+        index_prefix: str,
+        search_timeout=3.0,
+        elastic_services: Optional[
+            Deque[Tuple[Tuple[str, int], Tuple[str, int]]]
+        ] = None,
+        timeout_counter: Optional["PrometheusCounter"] = None,
+    ):
         self.hub_db = hub_db
         self.search_timeout = search_timeout
-        self.timeout_counter: Optional['PrometheusCounter'] = timeout_counter
-        self.sync_timeout = 600  # wont hit that 99% of the time, but can hit on a fresh import
+        self.timeout_counter: Optional["PrometheusCounter"] = timeout_counter
+        self.sync_timeout = (
+            600  # wont hit that 99% of the time, but can hit on a fresh import
+        )
         self.search_client: Optional[AsyncElasticsearch] = None
         self.sync_client: Optional[AsyncElasticsearch] = None
-        self.index = index_prefix + 'claims'
+        self.index = index_prefix + "claims"
         self.logger = logging.getLogger(__name__)
-        self.claim_cache = LRUCache(2 ** 15)
-        self.search_cache = LRUCache(2 ** 17)
+        self.claim_cache = LRUCache(2**15)
+        self.search_cache = LRUCache(2**17)
         self._elastic_services = elastic_services
         self.lost_connection = asyncio.Event()
 
     async def get_index_version(self) -> int:
         try:
             template = await self.sync_client.indices.get_template(self.index)
-            return template[self.index]['version']
+            return template[self.index]["version"]
         except NotFoundError:
             return 0
 
     async def set_index_version(self, version):
         await self.sync_client.indices.put_template(
-            self.index, body={'version': version, 'index_patterns': ['ignored']}, ignore=400
+            self.index,
+            body={"version": version, "index_patterns": ["ignored"]},
+            ignore=400,
         )
 
     async def start(self) -> bool:
         if self.sync_client:
             return False
-        hosts = [{'host': self._elastic_services[0][0][0], 'port': self._elastic_services[0][0][1]}]
+        hosts = [
+            {
+                "host": self._elastic_services[0][0][0],
+                "port": self._elastic_services[0][0][1],
+            }
+        ]
         self.sync_client = AsyncElasticsearch(hosts, timeout=self.sync_timeout)
-        self.search_client = AsyncElasticsearch(hosts, timeout=self.search_timeout+1)
+        self.search_client = AsyncElasticsearch(hosts, timeout=self.search_timeout + 1)
         while True:
             try:
-                await self.sync_client.cluster.health(wait_for_status='yellow')
+                await self.sync_client.cluster.health(wait_for_status="yellow")
                 break
             except ConnectionError:
-                self.logger.warning("Failed to connect to Elasticsearch. Waiting for it!")
+                self.logger.warning(
+                    "Failed to connect to Elasticsearch. Waiting for it!"
+                )
                 await asyncio.sleep(1)
 
-        res = await self.sync_client.indices.create(self.index, INDEX_DEFAULT_SETTINGS, ignore=400)
-        acked = res.get('acknowledged', False)
+        res = await self.sync_client.indices.create(
+            self.index, INDEX_DEFAULT_SETTINGS, ignore=400
+        )
+        acked = res.get("acknowledged", False)
         if acked:
             await self.set_index_version(self.VERSION)
             return acked
         index_version = await self.get_index_version()
         if index_version != self.VERSION:
-            self.logger.error("es search index has an incompatible version: %s vs %s", index_version, self.VERSION)
+            self.logger.error(
+                "es search index has an incompatible version: %s vs %s",
+                index_version,
+                self.VERSION,
+            )
             raise IndexVersionMismatch(index_version, self.VERSION)
         await self.sync_client.indices.refresh(self.index)
         return True
@@ -94,8 +127,8 @@ class SearchIndex:
         self.claim_cache.clear()
 
     def _make_resolve_result(self, es_result):
-        channel_hash = es_result['channel_hash']
-        reposted_claim_hash = es_result['reposted_claim_hash']
+        channel_hash = es_result["channel_hash"]
+        reposted_claim_hash = es_result["reposted_claim_hash"]
         channel_tx_hash = None
         channel_tx_position = None
         channel_height = None
@@ -115,28 +148,28 @@ class SearchIndex:
                 reposted_tx_position = repost_txo.position
                 reposted_height = bisect_right(self.hub_db.tx_counts, repost_txo.tx_num)
         return ResolveResult(
-            name=es_result['claim_name'],
-            normalized_name=es_result['normalized_name'],
-            claim_hash=es_result['claim_hash'],
-            tx_num=es_result['tx_num'],
-            position=es_result['tx_nout'],
-            tx_hash=es_result['tx_hash'],
-            height=es_result['height'],
-            amount=es_result['amount'],
-            short_url=es_result['short_url'],
-            is_controlling=es_result['is_controlling'],
-            canonical_url=es_result['canonical_url'],
-            creation_height=es_result['creation_height'],
-            activation_height=es_result['activation_height'],
-            expiration_height=es_result['expiration_height'],
-            effective_amount=es_result['effective_amount'],
-            support_amount=es_result['support_amount'],
-            last_takeover_height=es_result['last_take_over_height'],
-            claims_in_channel=es_result['claims_in_channel'],
+            name=es_result["claim_name"],
+            normalized_name=es_result["normalized_name"],
+            claim_hash=es_result["claim_hash"],
+            tx_num=es_result["tx_num"],
+            position=es_result["tx_nout"],
+            tx_hash=es_result["tx_hash"],
+            height=es_result["height"],
+            amount=es_result["amount"],
+            short_url=es_result["short_url"],
+            is_controlling=es_result["is_controlling"],
+            canonical_url=es_result["canonical_url"],
+            creation_height=es_result["creation_height"],
+            activation_height=es_result["activation_height"],
+            expiration_height=es_result["expiration_height"],
+            effective_amount=es_result["effective_amount"],
+            support_amount=es_result["support_amount"],
+            last_takeover_height=es_result["last_take_over_height"],
+            claims_in_channel=es_result["claims_in_channel"],
             channel_hash=channel_hash,
             reposted_claim_hash=reposted_claim_hash,
-            reposted=es_result['reposted'],
-            signature_valid=es_result['signature_valid'],
+            reposted=es_result["reposted"],
+            signature_valid=es_result["signature_valid"],
             reposted_tx_hash=reposted_tx_hash,
             reposted_tx_position=reposted_tx_position,
             reposted_height=reposted_height,
@@ -156,19 +189,44 @@ class SearchIndex:
             response, offset, total = await self.search(**kwargs)
             censored = {}
             for row in response:
-                if (row.get('censor_type') or 0) >= Censor.SEARCH:
-                    censoring_channel_hash = bytes.fromhex(row['censoring_channel_id'])[::-1]
+                if (row.get("censor_type") or 0) >= Censor.SEARCH:
+                    censoring_channel_hash = bytes.fromhex(row["censoring_channel_id"])[
+                        ::-1
+                    ]
                     censored.setdefault(censoring_channel_hash, set())
-                    censored[censoring_channel_hash].add(row['tx_hash'])
+                    censored[censoring_channel_hash].add(row["tx_hash"])
             total_referenced.extend(response)
             if censored:
-                response, _, _ = await self.search(**kwargs, censor_type=Censor.NOT_CENSORED)
+                response, _, _ = await self.search(
+                    **kwargs, censor_type=Censor.NOT_CENSORED
+                )
                 total_referenced.extend(response)
             response = [self._make_resolve_result(r) for r in response]
-            extra = [self._make_resolve_result(r) for r in await self._get_referenced_rows(total_referenced)]
-            result = Outputs.to_base64(
-                response, extra, offset, total, censored
-            )
+            extra = [
+                self._make_resolve_result(r)
+                for r in await self._get_referenced_rows(total_referenced)
+            ]
+            pending_claims = getattr(self.hub_db, "pending_claims", None)
+            if pending_claims and kwargs.get("offset", 0) == 0:
+                pending_rows, pending_extra = pending_claims.search(kwargs)
+                if pending_rows:
+                    confirmed_hashes = {row.claim_hash for row in response}
+                    pending_hashes = {row.claim_hash for row in pending_rows}
+                    response = pending_rows + [
+                        row for row in response if row.claim_hash not in pending_hashes
+                    ]
+                    response = response[: kwargs.get("limit", 10)]
+                    total += sum(
+                        1
+                        for row in pending_rows
+                        if row.claim_hash not in confirmed_hashes
+                    )
+                if pending_extra:
+                    seen_extra = {row.claim_hash for row in extra}
+                    extra.extend(
+                        row for row in pending_extra if row.claim_hash not in seen_extra
+                    )
+            result = Outputs.to_base64(response, extra, offset, total, censored)
             cache_item.result = result
             return result
 
@@ -177,13 +235,17 @@ class SearchIndex:
         return filter(None, map(self.claim_cache.get, claim_ids))
 
     async def populate_claim_cache(self, *claim_ids):
-        missing = [claim_id for claim_id in claim_ids if self.claim_cache.get(claim_id) is None]
+        missing = [
+            claim_id for claim_id in claim_ids if self.claim_cache.get(claim_id) is None
+        ]
         if missing:
             results = await self.search_client.mget(
                 index=self.index, body={"ids": missing}
             )
-            for result in expand_result(filter(lambda doc: doc['found'], results["docs"])):
-                self.claim_cache.set(result['claim_id'], result)
+            for result in expand_result(
+                filter(lambda doc: doc["found"], results["docs"])
+            ):
+                self.claim_cache.set(result["claim_id"], result)
 
     async def search(self, **kwargs):
         try:
@@ -194,12 +256,14 @@ class SearchIndex:
 
     async def search_ahead(self, **kwargs):
         # 'limit_claims_per_channel' case. Fetch 10000 results, reorder, slice, inflate and return
-        per_channel_per_page = kwargs.pop('limit_claims_per_channel', 0) or 0
-        remove_duplicates = kwargs.pop('remove_duplicates', False)
-        page_size = kwargs.pop('limit', 10)
-        offset = kwargs.pop('offset', 0)
-        kwargs['limit'] = 10000
-        cache_item = ResultCacheItem.from_cache(f"ahead{per_channel_per_page}{kwargs}", self.search_cache)
+        per_channel_per_page = kwargs.pop("limit_claims_per_channel", 0) or 0
+        remove_duplicates = kwargs.pop("remove_duplicates", False)
+        page_size = kwargs.pop("limit", 10)
+        offset = kwargs.pop("offset", 0)
+        kwargs["limit"] = 10000
+        cache_item = ResultCacheItem.from_cache(
+            f"ahead{per_channel_per_page}{kwargs}", self.search_cache
+        )
         if cache_item.result is not None:
             reordered_hits = cache_item.result
         else:
@@ -209,40 +273,64 @@ class SearchIndex:
                 else:
                     query = expand_query(**kwargs)
                     es_resp = await self.search_client.search(
-                        query, index=self.index, track_total_hits=False,
-                        timeout=f'{int(1000*self.search_timeout)}ms',
-                        _source_includes=['_id', 'channel_id', 'reposted_claim_id', 'creation_height']
+                        query,
+                        index=self.index,
+                        track_total_hits=False,
+                        timeout=f"{int(1000 * self.search_timeout)}ms",
+                        _source_includes=[
+                            "_id",
+                            "channel_id",
+                            "reposted_claim_id",
+                            "creation_height",
+                        ],
                     )
-                    search_hits = deque(es_resp['hits']['hits'])
-                    if self.timeout_counter and es_resp['timed_out']:
+                    search_hits = deque(es_resp["hits"]["hits"])
+                    if self.timeout_counter and es_resp["timed_out"]:
                         self.timeout_counter.inc()
                     if remove_duplicates:
                         search_hits = self.__remove_duplicates(search_hits)
                     if per_channel_per_page > 0:
-                        reordered_hits = self.__search_ahead(search_hits, page_size, per_channel_per_page)
+                        reordered_hits = self.__search_ahead(
+                            search_hits, page_size, per_channel_per_page
+                        )
                     else:
-                        reordered_hits = [(hit['_id'], hit['_source']['channel_id']) for hit in search_hits]
+                        reordered_hits = [
+                            (hit["_id"], hit["_source"]["channel_id"])
+                            for hit in search_hits
+                        ]
                     cache_item.result = reordered_hits
-        result = list(await self.get_many(*(claim_id for claim_id, _ in reordered_hits[offset:(offset + page_size)])))
+        result = list(
+            await self.get_many(
+                *(
+                    claim_id
+                    for claim_id, _ in reordered_hits[offset : (offset + page_size)]
+                )
+            )
+        )
         return result, 0, len(reordered_hits)
 
     def __remove_duplicates(self, search_hits: deque) -> deque:
         known_ids = {}  # claim_id -> (creation_height, hit_id), where hit_id is either reposted claim id or original
         dropped = set()
         for hit in search_hits:
-            hit_height, hit_id = hit['_source']['creation_height'], hit['_source']['reposted_claim_id'] or hit['_id']
+            hit_height, hit_id = (
+                hit["_source"]["creation_height"],
+                hit["_source"]["reposted_claim_id"] or hit["_id"],
+            )
             if hit_id not in known_ids:
-                known_ids[hit_id] = (hit_height, hit['_id'])
+                known_ids[hit_id] = (hit_height, hit["_id"])
             else:
                 previous_height, previous_id = known_ids[hit_id]
                 if hit_height < previous_height:
-                    known_ids[hit_id] = (hit_height, hit['_id'])
+                    known_ids[hit_id] = (hit_height, hit["_id"])
                     dropped.add(previous_id)
                 else:
-                    dropped.add(hit['_id'])
-        return deque(hit for hit in search_hits if hit['_id'] not in dropped)
+                    dropped.add(hit["_id"])
+        return deque(hit for hit in search_hits if hit["_id"] not in dropped)
 
-    def __search_ahead(self, search_hits: deque, page_size: int, per_channel_per_page: int) -> list:
+    def __search_ahead(
+        self, search_hits: deque, page_size: int, per_channel_per_page: int
+    ) -> list:
         reordered_hits = []
         channel_counters = Counter()
         next_page_hits_maybe_check_later = deque()
@@ -255,14 +343,17 @@ class SearchIndex:
                 break  # means last page was incomplete and we are left with bad replacements
             for _ in range(len(next_page_hits_maybe_check_later)):
                 claim_id, channel_id = next_page_hits_maybe_check_later.popleft()
-                if per_channel_per_page > 0 and channel_counters[channel_id] < per_channel_per_page:
+                if (
+                    per_channel_per_page > 0
+                    and channel_counters[channel_id] < per_channel_per_page
+                ):
                     reordered_hits.append((claim_id, channel_id))
                     channel_counters[channel_id] += 1
                 else:
                     next_page_hits_maybe_check_later.append((claim_id, channel_id))
             while search_hits:
                 hit = search_hits.popleft()
-                hit_id, hit_channel_id = hit['_id'], hit['_source']['channel_id']
+                hit_id, hit_channel_id = hit["_id"], hit["_source"]["channel_id"]
                 if hit_channel_id is None or per_channel_per_page <= 0:
                     reordered_hits.append((hit_id, hit_channel_id))
                 elif channel_counters[hit_channel_id] < per_channel_per_page:
@@ -276,14 +367,20 @@ class SearchIndex:
 
     async def _get_referenced_rows(self, txo_rows: List[dict]):
         txo_rows = [row for row in txo_rows if isinstance(row, dict)]
-        referenced_ids = set(filter(None, map(itemgetter('reposted_claim_id'), txo_rows)))
-        referenced_ids |= set(filter(None, (row['channel_id'] for row in txo_rows)))
-        referenced_ids |= set(filter(None, (row['censoring_channel_id'] for row in txo_rows)))
+        referenced_ids = set(
+            filter(None, map(itemgetter("reposted_claim_id"), txo_rows))
+        )
+        referenced_ids |= set(filter(None, (row["channel_id"] for row in txo_rows)))
+        referenced_ids |= set(
+            filter(None, (row["censoring_channel_id"] for row in txo_rows))
+        )
 
         referenced_txos = []
         if referenced_ids:
             referenced_txos.extend(await self.get_many(*referenced_ids))
-            referenced_ids = set(filter(None, (row['channel_id'] for row in referenced_txos)))
+            referenced_ids = set(
+                filter(None, (row["channel_id"] for row in referenced_txos))
+            )
 
         if referenced_ids:
             referenced_txos.extend(await self.get_many(*referenced_ids))
@@ -292,7 +389,7 @@ class SearchIndex:
 
 
 class ResultCacheItem:
-    __slots__ = '_result', 'lock', 'has_result'
+    __slots__ = "_result", "lock", "has_result"
 
     def __init__(self):
         self.has_result = asyncio.Event()

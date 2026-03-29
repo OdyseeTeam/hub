@@ -1,16 +1,19 @@
+import asyncio
 import time
 import typing
-import asyncio
+
 from prometheus_client import Counter
+
 from hub import PROMETHEUS_NAMESPACE
-from hub.scribe.daemon import LBCDaemon
-from hub.herald.session import SessionManager
-from hub.herald.mempool import HubMemPool
-from hub.herald.udp import StatusServer
 from hub.herald.db import HeraldDB
+from hub.herald.mempool import HubMemPool
 from hub.herald.search import SearchIndex
-from hub.service import BlockchainReaderService
+from hub.herald.session import SessionManager
+from hub.herald.udp import StatusServer
 from hub.notifier_protocol import ElasticNotifierClientProtocol
+from hub.scribe.daemon import LBCDaemon
+from hub.service import BlockchainReaderService
+
 if typing.TYPE_CHECKING:
     from hub.herald.env import ServerEnv
 
@@ -18,28 +21,43 @@ NAMESPACE = f"{PROMETHEUS_NAMESPACE}_hub"
 
 
 class HubServerService(BlockchainReaderService):
-    interrupt_count_metric = Counter("interrupt", "Number of interrupted queries", namespace=NAMESPACE)
+    interrupt_count_metric = Counter(
+        "interrupt", "Number of interrupted queries", namespace=NAMESPACE
+    )
 
-    def __init__(self, env: 'ServerEnv'):
-        super().__init__(env, 'lbry-reader', thread_workers=max(1, env.max_query_workers), thread_prefix='hub-worker')
+    def __init__(self, env: "ServerEnv"):
+        super().__init__(
+            env,
+            "lbry-reader",
+            thread_workers=max(1, env.max_query_workers),
+            thread_prefix="hub-worker",
+        )
         self.env = env
         self.notifications_to_send = []
         self.mempool_notifications = set()
         self.status_server = StatusServer()
-        self.daemon = LBCDaemon(env.coin, env.daemon_url, daemon_ca_path=env.daemon_ca_path)  # only needed for broadcasting txs
+        self.daemon = LBCDaemon(
+            env.coin, env.daemon_url, daemon_ca_path=env.daemon_ca_path
+        )  # only needed for broadcasting txs
         self.mempool = HubMemPool(self.env.coin, self.db)
 
         self.search_index = SearchIndex(
-            self.db, self.env.es_index_prefix, self.env.database_query_timeout,
+            self.db,
+            self.env.es_index_prefix,
+            self.env.database_query_timeout,
             elastic_services=self.env.elastic_services,
-            timeout_counter=self.interrupt_count_metric
+            timeout_counter=self.interrupt_count_metric,
         )
 
         self.session_manager = SessionManager(
-            env, self.db, self.mempool, self.daemon, self.search_index,
+            env,
+            self.db,
+            self.mempool,
+            self.daemon,
+            self.search_index,
             self.shutdown_event,
             on_available_callback=self.status_server.set_available,
-            on_unavailable_callback=self.status_server.set_unavailable
+            on_unavailable_callback=self.status_server.set_unavailable,
         )
         self.mempool.session_manager = self.session_manager
         self.es_notifications = asyncio.Queue()
@@ -53,11 +71,18 @@ class HubServerService(BlockchainReaderService):
     def open_db(self):
         env = self.env
         self.db = HeraldDB(
-            env.coin, env.db_dir, self.secondary_name, -1, env.reorg_limit,
-            env.cache_all_tx_hashes, blocking_channel_ids=env.blocking_channel_ids,
-            filtering_channel_ids=env.filtering_channel_ids, executor=self._executor,
-            index_address_status=env.index_address_status, merkle_cache_size=env.merkle_cache_size,
-            tx_cache_size=env.tx_cache_size
+            env.coin,
+            env.db_dir,
+            self.secondary_name,
+            -1,
+            env.reorg_limit,
+            env.cache_all_tx_hashes,
+            blocking_channel_ids=env.blocking_channel_ids,
+            filtering_channel_ids=env.filtering_channel_ids,
+            executor=self._executor,
+            index_address_status=env.index_address_status,
+            merkle_cache_size=env.merkle_cache_size,
+            tx_cache_size=env.tx_cache_size,
         )
 
     def clear_caches(self):
@@ -90,7 +115,9 @@ class HubServerService(BlockchainReaderService):
                 tx_hash = self.db.tx_num_mapping.pop(self.db.total_transactions.pop())
                 if tx_hash in self.db.tx_cache:
                     self.db.tx_cache.pop(tx_hash)
-            assert len(self.db.total_transactions) == tx_count, f"{len(self.db.total_transactions)} vs {tx_count}"
+            assert len(self.db.total_transactions) == tx_count, (
+                f"{len(self.db.total_transactions)} vs {tx_count}"
+            )
         self.db.merkle_cache.clear()
 
     def _detect_changes(self):
@@ -105,14 +132,18 @@ class HubServerService(BlockchainReaderService):
             return
         self.status_server.set_height(self.db.db_height, self.db.db_tip)
         if self.notifications_to_send:
-            for (touched, height) in self.notifications_to_send:
+            for touched, height in self.notifications_to_send:
                 await self.mempool.on_block(touched, height)
                 self.log.info("reader advanced to %i", height)
                 if self._es_height == self.db.db_height:
                     self.synchronized.set()
         if self.mempool_notifications:
+            self.clear_caches()
+            self.clear_search_cache()
             await self.mempool.on_mempool(
-                set(self.mempool.touched_hashXs), self.mempool_notifications, self.db.db_height
+                set(self.mempool.touched_hashXs),
+                self.mempool_notifications,
+                self.db.db_height,
             )
         self.mempool_notifications.clear()
         self.notifications_to_send.clear()
@@ -125,10 +156,15 @@ class HubServerService(BlockchainReaderService):
                 self.clear_search_cache()
                 if self.last_state and self._es_block_hash == self.last_state.tip:
                     self.synchronized.set()
-                    self.log.info("es and reader are in sync at block %i", self.last_state.height)
+                    self.log.info(
+                        "es and reader are in sync at block %i", self.last_state.height
+                    )
                 else:
-                    self.log.info("es and reader are not yet in sync (block %s vs %s)", self._es_height,
-                                  self.db.db_height)
+                    self.log.info(
+                        "es and reader are not yet in sync (block %s vs %s)",
+                        self._es_height,
+                        self.db.db_height,
+                    )
         finally:
             self.log.warning("closing es sync notification loop at %s", self._es_height)
             self.es_notification_client.close()
@@ -142,13 +178,19 @@ class HubServerService(BlockchainReaderService):
             try:
                 await self.es_notification_client.lost_connection.wait()
                 if not first_connect:
-                    self.log.warning("lost connection to scribe-elastic-sync notifier (%s:%i)",
-                                     self.es_notification_client.host, self.es_notification_client.port)
+                    self.log.warning(
+                        "lost connection to scribe-elastic-sync notifier (%s:%i)",
+                        self.es_notification_client.host,
+                        self.es_notification_client.port,
+                    )
                 await self.es_notification_client.connect()
                 first_connect = False
                 synchronized.set()
-                self.log.info("connected to es notifier on %s:%i", self.es_notification_client.host,
-                              self.es_notification_client.port)
+                self.log.info(
+                    "connected to es notifier on %s:%i",
+                    self.es_notification_client.host,
+                    self.es_notification_client.port,
+                )
                 await self.search_index.start()
             except Exception as e:
                 if not isinstance(e, asyncio.CancelledError):
@@ -157,12 +199,18 @@ class HubServerService(BlockchainReaderService):
                     self.search_index.clear_caches()
                     if len(self.env.elastic_services) > 1:
                         self.env.elastic_services.rotate(-1)
-                        self.log.warning("attempting to failover to %s:%i", self.es_notification_client.host,
-                                         self.es_notification_client.port)
+                        self.log.warning(
+                            "attempting to failover to %s:%i",
+                            self.es_notification_client.host,
+                            self.es_notification_client.port,
+                        )
                         await asyncio.sleep(1)
                     else:
-                        self.log.warning("waiting 30s for scribe-elastic-sync notifier to become available (%s:%i)",
-                                         self.es_notification_client.host, self.es_notification_client.port)
+                        self.log.warning(
+                            "waiting 30s for scribe-elastic-sync notifier to become available (%s:%i)",
+                            self.es_notification_client.host,
+                            self.es_notification_client.port,
+                        )
                         await asyncio.sleep(30)
                 else:
                     self.log.info("stopping the notifier loop")
@@ -171,8 +219,12 @@ class HubServerService(BlockchainReaderService):
     async def start_status_server(self):
         if self.env.udp_port and int(self.env.udp_port):
             await self.status_server.start(
-                0, bytes.fromhex(self.env.coin.GENESIS_HASH)[::-1], self.env.country,
-                self.env.host, self.env.udp_port, self.env.allow_lan_udp
+                0,
+                bytes.fromhex(self.env.coin.GENESIS_HASH)[::-1],
+                self.env.country,
+                self.env.host,
+                self.env.udp_port,
+                self.env.allow_lan_udp,
             )
 
     def _iter_start_tasks(self):
