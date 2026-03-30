@@ -147,6 +147,7 @@ class PendingClaimIndex:
             "invalid_channel_signature",
             "limit",
             "offset",
+            "order_by",
             "remove_duplicates",
             "no_totals",
         }
@@ -477,7 +478,7 @@ class PendingClaimIndex:
 
     def _finalize(self):
         touched_names = set(self.touched_names).union(self.pending_claims_by_name)
-        for claim_hash, record in self.claims_by_hash.items():
+        for claim_hash, record in list(self.claims_by_hash.items()):
             support_amount = max(
                 0,
                 self.db.get_support_amount(claim_hash)

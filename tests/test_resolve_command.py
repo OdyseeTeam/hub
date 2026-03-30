@@ -2458,6 +2458,93 @@ class ResolveAfterReorg(BaseResolveTestCase):
         self.assertEqual(0, search_results[0]["height"])
         self.assertEqual(0, search_results[0]["confirmations"])
 
+    async def test_pending_claim_resolve_and_search_immediately_after_broadcast(self):
+        name = "instant-mempool-hovercraft"
+
+        result = await self.resolve(name)
+        self.assertIn("error", result)
+        self.assertListEqual([], await self.claim_search(name=name))
+
+        tx = await self.daemon.jsonrpc_stream_create(
+            name,
+            "1.0",
+            file_path=self.create_upload_file(data=b"hi!"),
+            blocking=False,
+        )
+
+        resolved = await self.resolve(name)
+        self.assertEqual(tx.id, resolved["txid"])
+        self.assertEqual(0, resolved["height"])
+        self.assertEqual(0, resolved["confirmations"])
+
+        search_results = await self.claim_search(name=name)
+        self.assertEqual(1, len(search_results))
+        self.assertEqual(tx.id, search_results[0]["txid"])
+        self.assertEqual(0, search_results[0]["height"])
+        self.assertEqual(0, search_results[0]["confirmations"])
+
+        await self.ledger.wait(tx)
+
+    async def test_pending_claim_search_by_claim_id_with_release_time_order(self):
+        name = "ordered-mempool-hovercraft"
+
+        tx = await self.daemon.jsonrpc_stream_create(
+            name,
+            "1.0",
+            file_path=self.create_upload_file(data=b"hi!"),
+            release_time="2100-01-01T00:00:00Z",
+            blocking=False,
+        )
+
+        resolved = await self.resolve(name)
+        self.assertEqual(tx.id, resolved["txid"])
+        self.assertEqual(0, resolved["height"])
+        self.assertEqual(0, resolved["confirmations"])
+
+        search_results = await self.claim_search(
+            claim_id=resolved["claim_id"], order_by=["release_time"]
+        )
+        self.assertEqual(1, len(search_results))
+        self.assertEqual(tx.id, search_results[0]["txid"])
+        self.assertEqual(0, search_results[0]["height"])
+        self.assertEqual(0, search_results[0]["confirmations"])
+
+        await self.ledger.wait(tx)
+
+    async def test_blocking_stream_create_returns_before_next_block(self):
+        name = "blocking-mempool-hovercraft"
+
+        async def delayed_generate():
+            await asyncio.sleep(5)
+            await self.generate(1)
+
+        block_task = asyncio.create_task(delayed_generate())
+        try:
+            tx = await asyncio.wait_for(
+                self.daemon.jsonrpc_stream_create(
+                    name,
+                    "1.0",
+                    file_path=self.create_upload_file(data=b"hi!"),
+                    blocking=True,
+                ),
+                timeout=3,
+            )
+        finally:
+            if not block_task.done():
+                block_task.cancel()
+                try:
+                    await block_task
+                except asyncio.CancelledError:
+                    pass
+
+        resolved = await self.resolve(name)
+        self.assertEqual(tx.id, resolved["txid"])
+        self.assertEqual(0, resolved["height"])
+        self.assertEqual(0, resolved["confirmations"])
+
+        await self.generate(1)
+        await self.ledger.wait(tx, self.blockchain.block_expected)
+
     async def test_pending_signed_claim_resolve_and_search(self):
         channel = await self.channel_create("@mempool")
         channel_id = channel["outputs"][0]["claim_id"]
@@ -2482,6 +2569,37 @@ class ResolveAfterReorg(BaseResolveTestCase):
         self.assertEqual(tx.id, search_results[0]["txid"])
         self.assertEqual(0, search_results[0]["height"])
         self.assertEqual("@mempool", search_results[0]["signing_channel"]["name"])
+
+    async def test_pending_claim_search_with_es_style_filters(self):
+        channel = await self.channel_create("@mempool-filters")
+        channel_id = channel["outputs"][0]["claim_id"]
+        release_time = 2000000000
+
+        tx = await self.daemon.jsonrpc_stream_create(
+            "scheduled-mempool",
+            "1.0",
+            file_path=self.create_upload_file(data=b"hi!"),
+            channel_id=channel_id,
+            tags=["c:scheduled-livestream"],
+            release_time=release_time,
+            blocking=False,
+        )
+
+        search_results = await self.claim_search(
+            claim_type=["stream"],
+            any_tags=["c:scheduled-livestream"],
+            channel_ids=[channel_id],
+            order_by=["^release_time"],
+            release_time=[f">{release_time - 1000}"],
+        )
+        self.assertEqual(1, len(search_results))
+        self.assertEqual(tx.id, search_results[0]["txid"])
+        self.assertEqual(0, search_results[0]["height"])
+        self.assertEqual(
+            "@mempool-filters", search_results[0]["signing_channel"]["name"]
+        )
+
+        await self.ledger.wait(tx)
 
 
 def generate_signed_legacy(address: bytes, output: Output):

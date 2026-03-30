@@ -23,7 +23,12 @@ from typing import (
 )
 
 from hub import PROMETHEUS_NAMESPACE
-from hub.common import LFUCacheWithMetrics, LRUCacheWithMetrics, hash_to_hex_str
+from hub.common import (
+    LFUCacheWithMetrics,
+    LRUCacheWithMetrics,
+    ResumableSHA256,
+    hash_to_hex_str,
+)
 from hub.db.common import UTXO, DBError, ExpandedResolveResult, ResolveResult
 from hub.db.merkle import FastMerkleCacheItem, Merkle, MerkleCache
 from hub.db.prefixes import (
@@ -137,6 +142,7 @@ class SecondaryDB:
         self.total_transactions: List[bytes] = []
         self.tx_num_mapping: Dict[bytes, int] = {}
         self.pending_claims = None
+        self.live_mempool = None
 
         self.genesis_bytes = bytes.fromhex(self.coin.GENESIS_HASH)
 
@@ -1236,16 +1242,29 @@ class SecondaryDB:
             )
             return
 
-    async def get_claim_metadatas(self, txos: List[Tuple[bytes, int]]):
+    async def get_claim_metadatas(
+        self,
+        txos: List[Tuple[bytes, int]],
+        tx_map: typing.Optional[Dict[bytes, "Tx"]] = None,
+    ):
         tx_hashes = {tx_hash for tx_hash, _ in txos}
-        txs = {
-            k: self.coin.transaction(v)
-            async for ((k,), v) in self.prefix_db.tx.multi_get_async_gen(
-                self._executor,
-                [(tx_hash,) for tx_hash in tx_hashes],
-                deserialize_value=False,
+        txs = {}
+        if tx_map:
+            txs.update(
+                {tx_hash: tx for tx_hash, tx in tx_map.items() if tx_hash in tx_hashes}
             )
-        }
+        missing_hashes = tx_hashes.difference(txs)
+        if missing_hashes:
+            txs.update(
+                {
+                    k: self.coin.transaction(v)
+                    async for ((k,), v) in self.prefix_db.tx.multi_get_async_gen(
+                        self._executor,
+                        [(tx_hash,) for tx_hash in missing_hashes],
+                        deserialize_value=False,
+                    )
+                }
+            )
 
         def get_metadata(txo):
             if not txo:
@@ -1479,7 +1498,18 @@ class SecondaryDB:
         self.prefix_db.close()
         self.prefix_db = None
 
-    def _get_hashX_status(self, hashX: bytes):
+    def _get_live_hashX_status(self, hashX: bytes, mempool_history: str) -> bytes:
+        hasher_row = self.prefix_db.hashX_history_hasher.get(hashX)
+        if hasher_row is None:
+            hasher = ResumableSHA256()
+        else:
+            hasher = hasher_row.hasher.__copy__()
+        hasher.update(mempool_history.encode())
+        return hasher.digest()
+
+    def _get_hashX_status(self, hashX: bytes, mempool_history: Optional[str] = None):
+        if mempool_history:
+            return self._get_live_hashX_status(hashX, mempool_history).hex()
         mempool_status = self.prefix_db.hashX_mempool_status.get(
             hashX, deserialize_value=False
         )
@@ -1489,25 +1519,51 @@ class SecondaryDB:
         if status:
             return status.hex()
 
-    def _get_hashX_statuses(self, hashXes: List[bytes]):
-        statuses = {
-            hashX: status
-            for hashX, status in zip(
-                hashXes,
-                self.prefix_db.hashX_mempool_status.multi_get(
-                    [(hashX,) for hashX in hashXes], deserialize_value=False
-                ),
-            )
-            if status is not None
-        }
-        if len(statuses) < len(hashXes):
+    def _get_hashX_statuses(
+        self,
+        hashXes: List[bytes],
+        mempool_histories: Optional[Dict[bytes, str]] = None,
+    ):
+        statuses = {}
+        if mempool_histories:
+            live_hashXes = [hashX for hashX in hashXes if hashX in mempool_histories]
+            if live_hashXes:
+                for hashX, hasher_row in zip(
+                    live_hashXes,
+                    self.prefix_db.hashX_history_hasher.multi_get(
+                        [(hashX,) for hashX in live_hashXes]
+                    ),
+                ):
+                    if hasher_row is None:
+                        hasher = ResumableSHA256()
+                    else:
+                        hasher = hasher_row.hasher.__copy__()
+                    hasher.update(mempool_histories[hashX].encode())
+                    statuses[hashX] = hasher.digest()
+        remaining_hashXes = [hashX for hashX in hashXes if hashX not in statuses]
+        if remaining_hashXes:
             statuses.update(
                 {
                     hashX: status
                     for hashX, status in zip(
-                        hashXes,
+                        remaining_hashXes,
+                        self.prefix_db.hashX_mempool_status.multi_get(
+                            [(hashX,) for hashX in remaining_hashXes],
+                            deserialize_value=False,
+                        ),
+                    )
+                    if status is not None
+                }
+            )
+        if len(statuses) < len(hashXes):
+            remaining_hashXes = [hashX for hashX in hashXes if hashX not in statuses]
+            statuses.update(
+                {
+                    hashX: status
+                    for hashX, status in zip(
+                        remaining_hashXes,
                         self.prefix_db.hashX_status.multi_get(
-                            [(hashX,) for hashX in hashXes if hashX not in statuses],
+                            [(hashX,) for hashX in remaining_hashXes],
                             deserialize_value=False,
                         ),
                     )
@@ -1519,14 +1575,20 @@ class SecondaryDB:
             for hashX in hashXes
         ]
 
-    async def get_hashX_status(self, hashX: bytes):
+    async def get_hashX_status(
+        self, hashX: bytes, mempool_history: Optional[str] = None
+    ):
         return await asyncio.get_event_loop().run_in_executor(
-            self._executor, self._get_hashX_status, hashX
+            self._executor, self._get_hashX_status, hashX, mempool_history
         )
 
-    async def get_hashX_statuses(self, hashXes: List[bytes]):
+    async def get_hashX_statuses(
+        self,
+        hashXes: List[bytes],
+        mempool_histories: Optional[Dict[bytes, str]] = None,
+    ):
         return await asyncio.get_event_loop().run_in_executor(
-            self._executor, self._get_hashX_statuses, hashXes
+            self._executor, self._get_hashX_statuses, hashXes, mempool_histories
         )
 
     def get_tx_hash(self, tx_num: int) -> bytes:
@@ -1567,6 +1629,11 @@ class SecondaryDB:
         )
 
     def get_raw_mempool_tx(self, tx_hash: bytes) -> Optional[bytes]:
+        live_mempool = self.live_mempool
+        if live_mempool is not None:
+            raw_tx = live_mempool.raw_mempool.get(tx_hash)
+            if raw_tx is not None:
+                return raw_tx
         return self.prefix_db.mempool_tx.get(tx_hash, deserialize_value=False)
 
     def get_raw_confirmed_tx(self, tx_hash: bytes) -> Optional[bytes]:
@@ -1792,12 +1859,30 @@ class SecondaryDB:
                 {"block_height": -1},
             )
         if needed_mempool:
+            live_mempool = self.live_mempool
+            persisted_mempool = []
+            if live_mempool is not None:
+                for tx_hash_bytes in needed_mempool:
+                    tx = live_mempool.raw_mempool.get(tx_hash_bytes)
+                    if tx is None:
+                        persisted_mempool.append(tx_hash_bytes)
+                        continue
+                    self.tx_cache[tx_hash_bytes] = tx, None, None, -1
+                    tx_infos[tx_hash_bytes[::-1].hex()] = (
+                        tx.hex(),
+                        {"block_height": -1},
+                    )
+                    await asyncio.sleep(0)
+            else:
+                persisted_mempool = needed_mempool
+            if not persisted_mempool:
+                return {txid: tx_infos.get(txid) for txid in txids}
             for tx_hash_bytes, tx in zip(
-                needed_mempool,
+                persisted_mempool,
                 await run_in_executor(
                     self._executor,
                     self.prefix_db.mempool_tx.multi_get,
-                    [(tx_hash,) for tx_hash in needed_mempool],
+                    [(tx_hash,) for tx_hash in persisted_mempool],
                     True,
                     False,
                 ),

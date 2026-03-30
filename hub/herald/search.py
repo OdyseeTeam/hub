@@ -57,6 +57,7 @@ class SearchIndex:
         self.search_client: Optional[AsyncElasticsearch] = None
         self.sync_client: Optional[AsyncElasticsearch] = None
         self.index = index_prefix + "claims"
+        self.mempool_index = index_prefix + "claims_mempool"
         self.logger = logging.getLogger(__name__)
         self.claim_cache = LRUCache(2**15)
         self.search_cache = LRUCache(2**17)
@@ -101,6 +102,9 @@ class SearchIndex:
         res = await self.sync_client.indices.create(
             self.index, INDEX_DEFAULT_SETTINGS, ignore=400
         )
+        await self.sync_client.indices.create(
+            self.mempool_index, INDEX_DEFAULT_SETTINGS, ignore=400
+        )
         acked = res.get("acknowledged", False)
         if acked:
             await self.set_index_version(self.VERSION)
@@ -114,6 +118,7 @@ class SearchIndex:
             )
             raise IndexVersionMismatch(index_version, self.VERSION)
         await self.sync_client.indices.refresh(self.index)
+        await self.sync_client.indices.refresh(self.mempool_index)
         return True
 
     async def stop(self):
@@ -239,13 +244,26 @@ class SearchIndex:
             claim_id for claim_id in claim_ids if self.claim_cache.get(claim_id) is None
         ]
         if missing:
-            results = await self.search_client.mget(
-                index=self.index, body={"ids": missing}
+            mempool_results = await self.search_client.mget(
+                index=self.mempool_index, body={"ids": missing}
             )
+            found_in_mempool = set()
             for result in expand_result(
-                filter(lambda doc: doc["found"], results["docs"])
+                filter(lambda doc: doc["found"], mempool_results["docs"])
             ):
                 self.claim_cache.set(result["claim_id"], result)
+                found_in_mempool.add(result["claim_id"])
+            remaining = [
+                claim_id for claim_id in missing if claim_id not in found_in_mempool
+            ]
+            if remaining:
+                results = await self.search_client.mget(
+                    index=self.index, body={"ids": remaining}
+                )
+                for result in expand_result(
+                    filter(lambda doc: doc["found"], results["docs"])
+                ):
+                    self.claim_cache.set(result["claim_id"], result)
 
     async def search(self, **kwargs):
         try:
@@ -274,7 +292,7 @@ class SearchIndex:
                     query = expand_query(**kwargs)
                     es_resp = await self.search_client.search(
                         query,
-                        index=self.index,
+                        index=[self.mempool_index, self.index],
                         track_total_hits=False,
                         timeout=f"{int(1000 * self.search_timeout)}ms",
                         _source_includes=[
@@ -285,6 +303,7 @@ class SearchIndex:
                         ],
                     )
                     search_hits = deque(es_resp["hits"]["hits"])
+                    search_hits = self.__prefer_mempool_versions(search_hits)
                     if self.timeout_counter and es_resp["timed_out"]:
                         self.timeout_counter.inc()
                     if remove_duplicates:
@@ -308,6 +327,18 @@ class SearchIndex:
             )
         )
         return result, 0, len(reordered_hits)
+
+    def __prefer_mempool_versions(self, search_hits: deque) -> deque:
+        mempool_ids = {
+            hit["_id"] for hit in search_hits if hit.get("_index") == self.mempool_index
+        }
+        if not mempool_ids:
+            return search_hits
+        return deque(
+            hit
+            for hit in search_hits
+            if hit.get("_index") == self.mempool_index or hit["_id"] not in mempool_ids
+        )
 
     def __remove_duplicates(self, search_hits: deque) -> deque:
         known_ids = {}  # claim_id -> (creation_height, hit_id), where hit_id is either reposted claim id or original
