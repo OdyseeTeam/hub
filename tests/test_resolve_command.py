@@ -2512,6 +2512,35 @@ class ResolveAfterReorg(BaseResolveTestCase):
 
         await self.ledger.wait(tx)
 
+    async def test_pending_claim_search_by_claim_id_with_release_time_order_string(
+        self,
+    ):
+        name = "ordered-mempool-hovercraft-string"
+        release_time = 4102444800
+
+        tx = await self.daemon.jsonrpc_stream_create(
+            name,
+            "1.0",
+            file_path=self.create_upload_file(data=b"hi!"),
+            release_time=release_time,
+            blocking=False,
+        )
+
+        resolved = await self.resolve(name)
+        self.assertEqual(tx.id, resolved["txid"])
+        self.assertEqual(0, resolved["height"])
+        self.assertEqual(0, resolved["confirmations"])
+
+        search_results = await self.claim_search(
+            claim_id=resolved["claim_id"], order_by="release_time"
+        )
+        self.assertEqual(1, len(search_results))
+        self.assertEqual(tx.id, search_results[0]["txid"])
+        self.assertEqual(0, search_results[0]["height"])
+        self.assertEqual(0, search_results[0]["confirmations"])
+
+        await self.ledger.wait(tx)
+
     async def test_blocking_stream_create_returns_before_next_block(self):
         name = "blocking-mempool-hovercraft"
 
@@ -2708,6 +2737,340 @@ class ResolveAfterReorg(BaseResolveTestCase):
             any_tags=["old-collection-tag"],
         )
         self.assertListEqual([], old_results)
+
+    async def test_pending_claim_search_stream_types_filter(self):
+        """stream_types filter should work on pending claims."""
+        tx = await self.daemon.jsonrpc_stream_create(
+            "stream-type-test",
+            "1.0",
+            file_path=self.create_upload_file(data=b"video-data"),
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        results = await self.claim_search(
+            name="stream-type-test",
+            stream_types=["binary"],
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual(tx.id, results[0]["txid"])
+        self.assertEqual(0, results[0]["height"])
+
+        results = await self.claim_search(
+            name="stream-type-test",
+            stream_types=["video"],
+        )
+        self.assertListEqual([], results)
+
+    async def test_pending_claim_search_has_no_source(self):
+        """has_no_source filter should work on pending claims (e.g. livestreams)."""
+        tx = await self.daemon.jsonrpc_stream_create(
+            "source-test",
+            "1.0",
+            file_path=self.create_upload_file(data=b"has-source"),
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        results = await self.claim_search(
+            name="source-test",
+            has_source=True,
+        )
+        self.assertEqual(1, len(results))
+
+        results = await self.claim_search(
+            name="source-test",
+            has_no_source=True,
+        )
+        self.assertListEqual([], results)
+
+    async def test_pending_claim_search_not_tags_excludes(self):
+        """not_tags should exclude pending claims with those tags."""
+        tx = await self.daemon.jsonrpc_stream_create(
+            "nsfw-pending",
+            "1.0",
+            file_path=self.create_upload_file(data=b"data"),
+            tags=["nsfw", "content"],
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        results = await self.claim_search(
+            name="nsfw-pending",
+            not_tags=["nsfw"],
+        )
+        self.assertListEqual([], results)
+
+        results = await self.claim_search(
+            name="nsfw-pending",
+            not_tags=["unrelated"],
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual(tx.id, results[0]["txid"])
+
+    async def test_pending_claim_search_exclude_shorts(self):
+        """exclude_shorts should filter pending claims with portrait aspect + short duration."""
+        # Create a normal (non-short) stream -- uploaded file will have no video metadata
+        # so exclude_shorts should not affect it
+        tx = await self.daemon.jsonrpc_stream_create(
+            "not-a-short",
+            "1.0",
+            file_path=self.create_upload_file(data=b"long-video"),
+            tags=["test-shorts"],
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        # exclude_shorts should not filter it out (no aspect ratio / duration metadata)
+        results = await self.claim_search(
+            name="not-a-short",
+            exclude_shorts=True,
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual(tx.id, results[0]["txid"])
+
+    async def test_pending_claim_search_release_time_range(self):
+        """release_time range filters should work on pending claims."""
+        future_time = 4102444800  # 2100-01-01
+        tx = await self.daemon.jsonrpc_stream_create(
+            "future-release",
+            "1.0",
+            file_path=self.create_upload_file(data=b"data"),
+            release_time=future_time,
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        results = await self.claim_search(
+            name="future-release",
+            release_time=[f">{future_time - 1000}"],
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual(tx.id, results[0]["txid"])
+
+        results = await self.claim_search(
+            name="future-release",
+            release_time=[f"<{future_time - 1000}"],
+        )
+        self.assertListEqual([], results)
+
+    async def test_pending_claim_search_multiple_filters_combined(self):
+        """Multiple filters combined should narrow pending claim results correctly."""
+        channel = await self.channel_create("@filter-combo")
+        channel_id = channel["outputs"][0]["claim_id"]
+
+        tx = await self.daemon.jsonrpc_stream_create(
+            "combo-test",
+            "1.0",
+            file_path=self.create_upload_file(data=b"data"),
+            channel_id=channel_id,
+            tags=["c:scheduled-livestream"],
+            release_time=4102444800,
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        # All filters match
+        results = await self.claim_search(
+            claim_type=["stream"],
+            any_tags=["c:scheduled-livestream"],
+            channel_ids=[channel_id],
+            has_source=True,
+            release_time=[f">{4102444800 - 1000}"],
+            order_by=["^release_time"],
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual(tx.id, results[0]["txid"])
+
+        # Wrong channel -- should return empty
+        results = await self.claim_search(
+            claim_type=["stream"],
+            any_tags=["c:scheduled-livestream"],
+            channel_ids=["a" * 40],
+            has_source=True,
+            release_time=[f">{4102444800 - 1000}"],
+        )
+        self.assertListEqual([], results)
+
+        # Wrong claim_type -- should return empty
+        results = await self.claim_search(
+            claim_type=["channel"],
+            any_tags=["c:scheduled-livestream"],
+            channel_ids=[channel_id],
+        )
+        self.assertListEqual([], results)
+
+    async def test_pending_claim_search_filter_only_query_without_seed_selector(self):
+        """Broad filter-only pending searches should scan pending claims, not require a seed selector."""
+        matching = await self.daemon.jsonrpc_stream_create(
+            "filter-only-pending-match",
+            "1.0",
+            file_path=self.create_upload_file(data=b"data"),
+            tags=["filter-only-match-tag"],
+            release_time=4102444800,
+            blocking=False,
+        )
+        await self.daemon.jsonrpc_stream_create(
+            "filter-only-pending-miss",
+            "1.0",
+            file_path=self.create_upload_file(data=b"data"),
+            tags=["filter-only-other-tag"],
+            release_time=4102444700,
+            blocking=False,
+        )
+
+        results = await self.claim_search(
+            claim_type=["stream"],
+            any_tags=["filter-only-match-tag"],
+            has_source=True,
+            release_time=[">4102444790"],
+            order_by=["release_time"],
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual(matching.id, results[0]["txid"])
+        self.assertEqual(0, results[0]["height"])
+        self.assertEqual(0, results[0]["confirmations"])
+
+        await self.ledger.wait(matching)
+
+    async def test_pending_claim_search_not_channel_ids_excludes(self):
+        """not_channel_ids should exclude pending claims from those channels."""
+        channel = await self.channel_create("@excluded-channel")
+        channel_id = channel["outputs"][0]["claim_id"]
+
+        tx = await self.daemon.jsonrpc_stream_create(
+            "excluded-stream",
+            "1.0",
+            file_path=self.create_upload_file(data=b"data"),
+            channel_id=channel_id,
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        results = await self.claim_search(
+            name="excluded-stream",
+            not_channel_ids=[channel_id],
+        )
+        self.assertListEqual([], results)
+
+        results = await self.claim_search(
+            name="excluded-stream",
+            not_channel_ids=["a" * 40],
+        )
+        self.assertEqual(1, len(results))
+
+    async def test_pending_claim_search_text_query(self):
+        """text search should match pending claim names and titles."""
+        tx = await self.daemon.jsonrpc_stream_create(
+            "searchable-title-test",
+            "1.0",
+            file_path=self.create_upload_file(data=b"data"),
+            title="My Unique Hovercraft Video",
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        results = await self.claim_search(
+            text="hovercraft",
+        )
+        found = [r for r in results if r["txid"] == tx.id]
+        self.assertTrue(len(found) > 0)
+
+        results = await self.claim_search(
+            text="xyznonexistent",
+        )
+        found = [r for r in results if r["txid"] == tx.id]
+        self.assertListEqual([], found)
+
+    async def test_pending_claim_search_signature_valid_false_matches_unsigned(self):
+        """signature_valid=False should include unsigned pending claims."""
+        tx = await self.daemon.jsonrpc_stream_create(
+            "unsigned-pending-signature-valid",
+            "1.0",
+            file_path=self.create_upload_file(data=b"data"),
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        results = await self.claim_search(
+            name="unsigned-pending-signature-valid",
+            signature_valid=False,
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual(tx.id, results[0]["txid"])
+        self.assertEqual(0, results[0]["height"])
+
+    async def test_pending_repost_search_uses_reposted_projection_fields(self):
+        """Pending reposts should project stream-like filters from the reposted claim."""
+        source = await self.stream_create(
+            name="reposted-source-projection",
+            tags=["source-projection-tag"],
+            languages=["en"],
+        )
+        source_claim_id = source["outputs"][0]["claim_id"]
+
+        tx = await self.daemon.jsonrpc_stream_repost(
+            name="pending-repost-projection",
+            bid="1.0",
+            claim_id=source_claim_id,
+            tags=["repost-projection-tag"],
+            languages=["es"],
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        results = await self.claim_search(
+            name="pending-repost-projection",
+            claim_type=["repost"],
+            has_source=True,
+            stream_types=["binary"],
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual(tx.id, results[0]["txid"])
+        self.assertEqual(0, results[0]["height"])
+
+    async def test_pending_repost_search_unions_tags_and_languages(self):
+        """Pending reposts should match on both direct and reposted tags/languages."""
+        source = await self.stream_create(
+            name="reposted-source-union",
+            tags=["source-union-tag"],
+            languages=["en"],
+        )
+        source_claim_id = source["outputs"][0]["claim_id"]
+
+        tx = await self.daemon.jsonrpc_stream_repost(
+            name="pending-repost-union",
+            bid="1.0",
+            claim_id=source_claim_id,
+            tags=["repost-union-tag"],
+            languages=["es"],
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        results = await self.claim_search(
+            name="pending-repost-union",
+            claim_type=["repost"],
+            any_tags=["source-union-tag"],
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual(tx.id, results[0]["txid"])
+
+        results = await self.claim_search(
+            name="pending-repost-union",
+            claim_type=["repost"],
+            any_tags=["repost-union-tag"],
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual(tx.id, results[0]["txid"])
+
+        results = await self.claim_search(
+            name="pending-repost-union",
+            claim_type=["repost"],
+            all_languages=["en", "es"],
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual(tx.id, results[0]["txid"])
 
 
 def generate_signed_legacy(address: bytes, output: Output):

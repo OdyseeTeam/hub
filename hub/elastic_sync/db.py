@@ -55,6 +55,7 @@ class ElasticSyncDB(SecondaryDB):
         claims: Dict[bytes, ResolveResult],
         extras,
         tx_map=None,
+        pending_tx_timestamps: Optional[Dict[bytes, int]] = None,
     ):
         metadatas = {}
         needed_txos = set()
@@ -204,10 +205,18 @@ class ElasticSyncDB(SecondaryDB):
                 "tx_num": claim.tx_num,
                 "tx_nout": claim.position,
                 "amount": claim.amount,
-                "timestamp": pending_now
+                "timestamp": (
+                    pending_tx_timestamps.get(claim.tx_hash, pending_now)
+                    if pending_tx_timestamps
+                    else pending_now
+                )
                 if claim.height <= 0
                 else self.estimate_timestamp(claim.height),
-                "creation_timestamp": pending_now
+                "creation_timestamp": (
+                    pending_tx_timestamps.get(claim.tx_hash, pending_now)
+                    if pending_tx_timestamps
+                    else pending_now
+                )
                 if claim.creation_height <= 0
                 else self.estimate_timestamp(claim.creation_height),
                 "height": claim.height,
@@ -335,7 +344,9 @@ class ElasticSyncDB(SecondaryDB):
             yield value
 
     async def prepare_pending_claim_metadata_batch(
-        self, pending_claims: PendingClaimIndex
+        self,
+        pending_claims: PendingClaimIndex,
+        pending_tx_timestamps: Optional[Dict[bytes, int]] = None,
     ):
         claims = {}
         total_extras = {}
@@ -360,7 +371,10 @@ class ElasticSyncDB(SecondaryDB):
                         if repost_channel:
                             total_extras[repost.channel_hash] = repost_channel
         async for claim in self.prepare_claim_metadata_batch(
-            claims, total_extras, tx_map=pending_claims.tx_by_hash
+            claims,
+            total_extras,
+            tx_map=pending_claims.tx_by_hash,
+            pending_tx_timestamps=pending_tx_timestamps,
         ):
             if claim:
                 yield claim

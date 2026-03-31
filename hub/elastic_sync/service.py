@@ -4,6 +4,7 @@ import json
 import os
 import typing
 from collections import defaultdict
+from time import time
 
 from elasticsearch import AsyncElasticsearch, ConnectionError, NotFoundError
 from elasticsearch.helpers import async_streaming_bulk
@@ -64,6 +65,8 @@ class ElasticSyncService(BlockchainReaderService):
             self, "_pending_claims", None
         )
         self._mempool_claim_hashes = set()
+        self._mempool_claim_docs: typing.Dict[bytes, dict] = {}
+        self._mempool_tx_timestamps: typing.Dict[bytes, int] = {}
         self._last_mempool_tx_hashes: typing.Set[bytes] = set()
         self._last_mempool_height = -1
 
@@ -355,17 +358,25 @@ class ElasticSyncService(BlockchainReaderService):
             and self._last_mempool_height == self.db.db_height
         ):
             return False
+        stale_tx_hashes = set(self._mempool_tx_timestamps).difference(current_tx_hashes)
+        for tx_hash in stale_tx_hashes:
+            self._mempool_tx_timestamps.pop(tx_hash, None)
+        now = int(time())
+        for tx_hash in current_tx_hashes:
+            self._mempool_tx_timestamps.setdefault(tx_hash, now)
         self._pending_claims.rebuild(raw_mempool)
         self._last_mempool_tx_hashes = current_tx_hashes
         self._last_mempool_height = self.db.db_height
         return True
 
-    async def _mempool_claim_producer(self, deleted_claims: typing.Set[bytes]):
+    async def _mempool_claim_producer(
+        self,
+        deleted_claims: typing.Set[bytes],
+        updated_claims: typing.Dict[bytes, dict],
+    ):
         for claim_hash in deleted_claims:
             yield self._delete_claim_query(self.mempool_index, claim_hash)
-        async for claim in self.db.prepare_pending_claim_metadata_batch(
-            self._pending_claims
-        ):
+        for claim in updated_claims.values():
             yield self._upsert_claim_query(self.mempool_index, claim)
 
     async def refresh_mempool_index(self):
@@ -377,14 +388,46 @@ class ElasticSyncService(BlockchainReaderService):
         previous_claim_hashes = self._mempool_claim_hashes
         current_claim_hashes = set(self._pending_claims.claims_by_hash)
         deleted_claims = previous_claim_hashes.difference(current_claim_hashes)
-        self._mempool_claim_hashes = current_claim_hashes
         if not deleted_claims and not current_claim_hashes:
+            self._mempool_claim_hashes = current_claim_hashes
+            self._mempool_claim_docs.clear()
+            return
+        current_docs = {}
+        async for claim in self.db.prepare_pending_claim_metadata_batch(
+            self._pending_claims,
+            pending_tx_timestamps=self._mempool_tx_timestamps,
+        ):
+            if claim:
+                current_docs[bytes.fromhex(claim["claim_id"])] = claim
+        # tx_num is a virtual sequential number that shifts whenever a new
+        # mempool tx sorts between existing ones — exclude it from the delta
+        # comparison so we don't rewrite every doc on each new tx arrival.
+        _VOLATILE_FIELDS = {"tx_num"}
+
+        def _doc_changed(claim_hash, new_doc):
+            old_doc = self._mempool_claim_docs.get(claim_hash)
+            if old_doc is None:
+                return True
+            return any(
+                new_doc.get(k) != old_doc.get(k)
+                for k in set(new_doc) | set(old_doc)
+                if k not in _VOLATILE_FIELDS
+            )
+
+        updated_claims = {
+            claim_hash: claim
+            for claim_hash, claim in current_docs.items()
+            if _doc_changed(claim_hash, claim)
+        }
+        self._mempool_claim_hashes = current_claim_hashes
+        if not deleted_claims and not updated_claims:
+            self._mempool_claim_docs = current_docs
             return
         cnt = 0
         success = 0
         async for ok, item in async_streaming_bulk(
             self.sync_client,
-            self._mempool_claim_producer(deleted_claims),
+            self._mempool_claim_producer(deleted_claims, updated_claims),
             raise_on_error=False,
         ):
             cnt += 1
@@ -392,6 +435,7 @@ class ElasticSyncService(BlockchainReaderService):
                 self.log.warning("mempool indexing failed for an item: %s", item)
             else:
                 success += 1
+        self._mempool_claim_docs = current_docs
         await self.sync_client.indices.refresh(self.mempool_index)
         self.log.info(
             "Indexed mempool overlay claims. %i/%i successful, %i pending claims",
@@ -459,7 +503,6 @@ class ElasticSyncService(BlockchainReaderService):
 
     async def poll_for_changes(self):
         await super().poll_for_changes()
-        await self.refresh_mempool_index()
         cnt = 0
         success = 0
         if self._advanced:
@@ -495,6 +538,7 @@ class ElasticSyncService(BlockchainReaderService):
             self.notify_es_notification_listeners(
                 self._last_wrote_height, self.db.db_tip
             )
+        await self.refresh_mempool_index()
 
     @property
     def last_synced_height(self) -> int:
@@ -632,6 +676,8 @@ class ElasticSyncService(BlockchainReaderService):
             self.write_es_height(0, self.env.coin.GENESIS_HASH)
             await self._sync_all_claims()
             self._mempool_claim_hashes.clear()
+            self._mempool_claim_docs.clear()
+            self._mempool_tx_timestamps.clear()
             self._last_mempool_tx_hashes = set()
             self._last_mempool_height = -1
             await self.sync_client.indices.refresh(self.index)

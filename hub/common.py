@@ -863,8 +863,8 @@ def expand_query(**kwargs):
             include_missing = True
             key = key[:-len('_or_missing')]
         many = key.endswith('__in') or isinstance(value, list)
-        if many and len(value) > 2048:
-            raise TooManyClaimSearchParametersError(key, 2048)
+        if many and len(value) > 3072:
+            raise TooManyClaimSearchParametersError(key, 3072)
         if many:
             key = key.replace('__in', '')
             value = list(filter(None, value))

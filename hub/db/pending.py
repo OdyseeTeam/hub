@@ -1,3 +1,4 @@
+import time as _time
 import typing
 from bisect import bisect_right
 from collections import defaultdict
@@ -6,6 +7,7 @@ from struct import pack
 
 from hub.common import StagedClaimtrieItem, hash160
 from hub.db.common import ExpandedResolveResult, ResolveResult
+from hub.schema.mime_types import guess_stream_type
 from hub.schema.url import URL, PathSegment, normalize_name
 from hub.scribe.transaction import Tx, TxOutput
 from hub.scribe.transaction.deserializer import Deserializer
@@ -150,17 +152,51 @@ class PendingClaimIndex:
             "all_tags",
             "not_tags",
             "release_time",
+            "creation_timestamp",
             "has_source",
+            "has_no_source",
+            "stream_types",
+            "duration",
+            "fee_amount",
+            "fee_currency",
+            "content_aspect_ratio",
+            "any_languages",
+            "all_languages",
+            "media_types",
+            "not_claim_id",
+            "exclude_shorts",
+            "exclude_shorts_aspect_ratio_lte",
+            "exclude_shorts_duration_lte",
+            "text",
+            "amount_order",
+            "signature_valid",
             "limit",
             "offset",
             "order_by",
             "remove_duplicates",
             "no_totals",
+            "index",
+            "limit_claims_per_channel",
         }
         if any(key not in supported for key in kwargs):
             return [], []
 
         candidate_hashes: typing.Optional[typing.Set[bytes]] = None
+
+        def decode_hex_bytes(value: str) -> typing.Optional[bytes]:
+            try:
+                return bytes.fromhex(value)
+            except (TypeError, ValueError):
+                return None
+
+        def decode_hex_set(values) -> typing.Optional[typing.Set[bytes]]:
+            decoded = set()
+            for value in values:
+                item = decode_hex_bytes(value)
+                if item is None:
+                    return None
+                decoded.add(item)
+            return decoded
 
         def intersect(matches: typing.Iterable[bytes]):
             nonlocal candidate_hashes
@@ -190,7 +226,10 @@ class PendingClaimIndex:
                 if claim_hash.hex() in wanted
             )
         if kwargs.get("txid"):
-            tx_hash = bytes.fromhex(kwargs["txid"])[::-1]
+            tx_hash = decode_hex_bytes(kwargs["txid"])
+            if tx_hash is None:
+                return [], []
+            tx_hash = tx_hash[::-1]
             tx_num = self.tx_num_by_hash.get(tx_hash)
             if tx_num is not None and kwargs.get("nout") is not None:
                 claim_hash = self._claim_hash_for_txo(
@@ -203,7 +242,9 @@ class PendingClaimIndex:
                 else:
                     intersect([])
         if kwargs.get("channel_id"):
-            channel_hash = bytes.fromhex(kwargs["channel_id"])
+            channel_hash = decode_hex_bytes(kwargs["channel_id"])
+            if channel_hash is None:
+                return [], []
             intersect(
                 claim_hash
                 for (
@@ -214,9 +255,9 @@ class PendingClaimIndex:
                 for claim_hash in claim_hashes
             )
         if kwargs.get("channel_ids"):
-            channel_hashes = {
-                bytes.fromhex(channel_id) for channel_id in kwargs["channel_ids"]
-            }
+            channel_hashes = decode_hex_set(kwargs["channel_ids"])
+            if channel_hashes is None:
+                return [], []
             intersect(
                 claim_hash
                 for (
@@ -226,8 +267,21 @@ class PendingClaimIndex:
                 if signing_hash in channel_hashes
                 for claim_hash in claim_hashes
             )
+        if kwargs.get("not_claim_id"):
+            not_ids = kwargs["not_claim_id"]
+            if isinstance(not_ids, str):
+                not_ids = [not_ids]
+            excluded = set()
+            for nid in not_ids:
+                decoded = decode_hex_bytes(nid)
+                if decoded:
+                    excluded.add(decoded)
+            if candidate_hashes is not None:
+                candidate_hashes.difference_update(excluded)
+            else:
+                candidate_hashes = set(self.claims_by_hash) - excluded
         if candidate_hashes is None:
-            return [], []
+            candidate_hashes = set(self.claims_by_hash)
 
         rows = []
         extras = {}
@@ -254,14 +308,52 @@ class PendingClaimIndex:
                         if repost_channel:
                             extras[repost_channel.claim_hash] = repost_channel
 
+        amount_order = kwargs.get("amount_order")
+        if amount_order:
+            rows.sort(
+                key=lambda item: (
+                    -item[0].effective_amount,
+                    item[0].tx_num,
+                    item[0].position,
+                )
+            )
+            offset = max(0, int(amount_order) - 1)
+            return (
+                [rows[offset][0]] if offset < len(rows) else [],
+                list(extras.values()),
+            )
         self._sort_search_rows(rows, kwargs)
         limit = kwargs.get("limit", 10)
         return [row for row, _ in rows[:limit]], list(extras.values())
+
+    def _resolve_effective_metadata(self, record: PendingClaimRecord, metadata):
+        """For reposts, resolve the reposted claim's metadata for field projection."""
+        if not metadata or not metadata.is_repost:
+            return metadata
+        reposted_hash = metadata.repost.reference.claim_hash[::-1]
+        reposted = self._get_claim_result(reposted_hash)
+        if not reposted:
+            return metadata
+        # Try pending tx first, then confirmed
+        reposted_tx = self.tx_by_hash.get(reposted.tx_hash)
+        if reposted_tx is None:
+            reposted_tx = self.parsed_tx_cache.get(reposted.tx_hash)
+        if reposted_tx is None:
+            raw = self.db.get_raw_tx(reposted.tx_hash)
+            if raw:
+                reposted_tx = self.coin.transaction(raw)
+                self.parsed_tx_cache[reposted.tx_hash] = reposted_tx
+        if reposted_tx and reposted.position < len(reposted_tx.outputs):
+            return self._safe_metadata(reposted_tx.outputs[reposted.position])
+        return metadata
 
     def _matches_search(self, record: PendingClaimRecord, kwargs: dict) -> bool:
         claim = record.claim
         claim_type = kwargs.get("claim_type")
         metadata = self._safe_metadata(record.tx.outputs[claim.position])
+        # For filters that project reposted-claim fields (has_source, stream_types,
+        # duration, fee, aspect_ratio, media_types), use the reposted claim's metadata
+        effective_metadata = self._resolve_effective_metadata(record, metadata)
         if claim_type:
             claim_types = (
                 claim_type
@@ -277,9 +369,13 @@ class PendingClaimIndex:
         ):
             return False
         if kwargs.get("not_channel_ids"):
-            not_channel_hashes = {
-                bytes.fromhex(channel_id) for channel_id in kwargs["not_channel_ids"]
-            }
+            try:
+                not_channel_hashes = {
+                    bytes.fromhex(channel_id)
+                    for channel_id in kwargs["not_channel_ids"]
+                }
+            except (TypeError, ValueError):
+                return False
             if claim.signing_hash in not_channel_hashes:
                 return False
         has_signature = claim.signing_hash is not None
@@ -294,7 +390,9 @@ class PendingClaimIndex:
             not has_signature or claim.channel_signature_is_valid
         ):
             return False
-        tags = set(self._metadata_tags(metadata))
+        tags = self._metadata_tags(metadata)
+        if metadata and metadata.is_repost and effective_metadata is not metadata:
+            tags = tags.union(self._metadata_tags(effective_metadata))
         any_tags = kwargs.get("any_tags")
         if any_tags and not tags.intersection(any_tags):
             return False
@@ -305,13 +403,91 @@ class PendingClaimIndex:
         if not_tags and tags.intersection(not_tags):
             return False
         has_source = kwargs.get("has_source")
-        if has_source is not None and self._metadata_has_source(metadata) != has_source:
-            return False
+        if has_source is not None:
+            if self._metadata_has_source(effective_metadata) != has_source:
+                return False
+        has_no_source = kwargs.get("has_no_source")
+        if has_no_source is not None:
+            if self._metadata_has_source(effective_metadata) == has_no_source:
+                return False
         release_time = kwargs.get("release_time")
         if release_time and not self._matches_range(
             self._metadata_release_time(record, metadata), release_time
         ):
             return False
+        creation_timestamp = kwargs.get("creation_timestamp")
+        if creation_timestamp and not self._matches_range(
+            self._metadata_creation_timestamp(record), creation_timestamp
+        ):
+            return False
+        stream_types = kwargs.get("stream_types")
+        if stream_types:
+            actual_stream_type = self._metadata_stream_type(effective_metadata)
+            if actual_stream_type not in stream_types:
+                return False
+        duration = kwargs.get("duration")
+        if duration and not self._matches_range(
+            self._metadata_duration(effective_metadata), duration
+        ):
+            return False
+        fee_amount = kwargs.get("fee_amount")
+        if fee_amount and not self._matches_range(
+            self._metadata_fee_amount(effective_metadata), fee_amount
+        ):
+            return False
+        fee_currency = kwargs.get("fee_currency")
+        if fee_currency:
+            if (
+                self._metadata_fee_currency(effective_metadata).upper()
+                != fee_currency.upper()
+            ):
+                return False
+        content_aspect_ratio = kwargs.get("content_aspect_ratio")
+        if content_aspect_ratio and not self._matches_range_float(
+            self._metadata_aspect_ratio(effective_metadata), content_aspect_ratio
+        ):
+            return False
+        any_languages = kwargs.get("any_languages")
+        if any_languages:
+            claim_languages = self._metadata_languages(metadata)
+            if metadata and metadata.is_repost and effective_metadata is not metadata:
+                claim_languages = claim_languages.union(
+                    self._metadata_languages(effective_metadata)
+                )
+            if not claim_languages.intersection(any_languages):
+                return False
+        all_languages = kwargs.get("all_languages")
+        if all_languages:
+            claim_languages = self._metadata_languages(metadata)
+            if metadata and metadata.is_repost and effective_metadata is not metadata:
+                claim_languages = claim_languages.union(
+                    self._metadata_languages(effective_metadata)
+                )
+            if not set(all_languages).issubset(claim_languages):
+                return False
+        media_types = kwargs.get("media_types")
+        if media_types:
+            actual_media_type = self._metadata_media_type(effective_metadata)
+            if actual_media_type not in media_types:
+                return False
+        signature_valid = kwargs.get("signature_valid")
+        if signature_valid is not None:
+            has_sig = claim.signing_hash is not None
+            if signature_valid and not claim.channel_signature_is_valid:
+                return False
+            if not signature_valid and has_sig and claim.channel_signature_is_valid:
+                return False
+        if kwargs.get("exclude_shorts"):
+            aspect = self._metadata_aspect_ratio(effective_metadata)
+            dur = self._metadata_duration(effective_metadata)
+            max_aspect = kwargs.get("exclude_shorts_aspect_ratio_lte", 0.95)
+            max_dur = kwargs.get("exclude_shorts_duration_lte", 180)
+            if aspect and dur and aspect <= max_aspect and dur <= max_dur:
+                return False
+        text_query = kwargs.get("text")
+        if text_query:
+            if not self._matches_text(claim, metadata, text_query):
+                return False
         return True
 
     def _pending_claim_type(self, claim: StagedClaimtrieItem, metadata) -> str:
@@ -325,18 +501,18 @@ class PendingClaimIndex:
             return "claimreference"
         return "stream"
 
-    def _metadata_tags(self, metadata) -> typing.List[str]:
+    def _metadata_tags(self, metadata) -> typing.Set[str]:
         if not metadata:
-            return []
+            return set()
         if metadata.is_stream:
-            return list(metadata.stream.tags)
+            return set(metadata.stream.tags)
         if metadata.is_channel:
-            return list(metadata.channel.tags)
+            return set(metadata.channel.tags)
         if metadata.is_collection:
-            return list(metadata.collection.tags)
+            return set(metadata.collection.tags)
         if metadata.is_repost:
-            return list(metadata.repost.tags)
-        return []
+            return set(metadata.repost.tags)
+        return set()
 
     def _metadata_has_source(self, metadata) -> bool:
         return bool(metadata and metadata.is_stream and metadata.stream.has_source)
@@ -345,11 +521,136 @@ class PendingClaimIndex:
         if metadata and metadata.is_stream:
             release_time = metadata.stream.release_time or 0
             if isinstance(release_time, str):
-                return 0
-            return int(release_time)
-        return 0
+                return self._metadata_creation_timestamp(record)
+            return (
+                int(release_time)
+                if release_time
+                else self._metadata_creation_timestamp(record)
+            )
+        # Non-stream types (repost, collection) use creation_timestamp, matching ES
+        return self._metadata_creation_timestamp(record)
 
-    def _matches_range(self, actual: int, constraints: typing.Iterable[str]) -> bool:
+    def _metadata_creation_timestamp(self, record: PendingClaimRecord) -> int:
+        claim = record.claim
+        if claim.root_tx_num > self.db.db_tx_count:
+            return int(_time.time())
+        creation_height = bisect_right(self.db.tx_counts, claim.root_tx_num)
+        if creation_height <= 0:
+            return int(_time.time())
+        header = self.db.prefix_db.header.get(creation_height, deserialize_value=False)
+        if not header:
+            return 0
+        return int.from_bytes(header[100:104], byteorder="little")
+
+    def _metadata_stream_type(self, metadata) -> str:
+        if not metadata or not metadata.is_stream or not metadata.stream.has_source:
+            return ""
+        return guess_stream_type(metadata.stream.source.media_type)
+
+    def _metadata_duration(self, metadata) -> int:
+        if not metadata or not metadata.is_stream:
+            return 0
+        return metadata.stream.video.duration or metadata.stream.audio.duration or 0
+
+    def _metadata_fee_amount(self, metadata) -> int:
+        if not metadata or not metadata.is_stream or not metadata.stream.has_fee:
+            return 0
+        return int(max(metadata.stream.fee.amount or 0, 0) * 1000)
+
+    def _metadata_fee_currency(self, metadata) -> str:
+        if not metadata or not metadata.is_stream or not metadata.stream.has_fee:
+            return ""
+        return metadata.stream.fee.currency or ""
+
+    def _metadata_aspect_ratio(self, metadata) -> float:
+        if (
+            not metadata
+            or not metadata.is_stream
+            or not metadata.stream.video
+            or not metadata.stream.video.height
+            or not metadata.stream.video.width
+        ):
+            return 0.0
+        return metadata.stream.video.width / metadata.stream.video.height
+
+    def _metadata_media_type(self, metadata) -> str:
+        if not metadata or not metadata.is_stream or not metadata.stream.has_source:
+            return ""
+        return metadata.stream.source.media_type or ""
+
+    def _matches_text(self, claim: StagedClaimtrieItem, metadata, query: str) -> bool:
+        query_lower = query.lower()
+        if query_lower in claim.name.lower():
+            return True
+        if not metadata:
+            return False
+        if metadata.is_stream:
+            meta = metadata.stream
+        elif metadata.is_channel:
+            meta = metadata.channel
+        elif metadata.is_collection:
+            meta = metadata.collection
+        elif metadata.is_repost:
+            meta = metadata.repost
+        else:
+            return False
+        if hasattr(meta, "title") and meta.title and query_lower in meta.title.lower():
+            return True
+        if (
+            hasattr(meta, "description")
+            and meta.description
+            and query_lower in meta.description.lower()
+        ):
+            return True
+        if (
+            hasattr(meta, "author")
+            and meta.author
+            and query_lower in meta.author.lower()
+        ):
+            return True
+        if any(query_lower in tag.lower() for tag in meta.tags):
+            return True
+        return False
+
+    def _metadata_languages(self, metadata) -> typing.Set[str]:
+        if not metadata:
+            return set()
+        if metadata.is_stream:
+            meta = metadata.stream
+        elif metadata.is_channel:
+            meta = metadata.channel
+        elif metadata.is_collection:
+            meta = metadata.collection
+        elif metadata.is_repost:
+            meta = metadata.repost
+        else:
+            return set()
+        langs = {lang.language or "none" for lang in meta.languages}
+        return langs or {"none"}
+
+    def _matches_range_float(self, actual: float, constraints) -> bool:
+        if isinstance(constraints, str):
+            constraints = [constraints]
+        for constraint in constraints:
+            if not constraint:
+                continue
+            operator = (
+                constraint[:2] if constraint[:2] in {">=", "<="} else constraint[:1]
+            )
+            value = float(constraint[len(operator) :])
+            if operator == ">" and not actual > value:
+                return False
+            if operator == ">=" and not actual >= value:
+                return False
+            if operator == "<" and not actual < value:
+                return False
+            if operator == "<=" and not actual <= value:
+                return False
+        return True
+
+    def _matches_range(self, actual: int, constraints) -> bool:
+        if isinstance(constraints, str):
+            constraints = [constraints]
         for constraint in constraints:
             if not constraint:
                 continue
@@ -373,6 +674,8 @@ class PendingClaimIndex:
         kwargs: dict,
     ):
         order_by = kwargs.get("order_by") or []
+        if isinstance(order_by, str):
+            order_by = [order_by]
         if not order_by:
             rows.sort(
                 key=lambda item: (
@@ -397,6 +700,8 @@ class PendingClaimIndex:
             metadata = metadata_by_claim_hash.get(record.claim.claim_hash)
             if field == "release_time":
                 return self._metadata_release_time(record, metadata)
+            if field == "creation_timestamp":
+                return self._metadata_creation_timestamp(record)
             if field == "name":
                 return row.normalized_name
             if field == "height":
@@ -409,6 +714,13 @@ class PendingClaimIndex:
                 return row.support_amount
             if field == "tx_num":
                 return row.tx_num
+            if field in (
+                "trending_group",
+                "trending_mixed",
+                "trending_local",
+                "trending_global",
+            ):
+                return 0
             return getattr(row, field, 0)
 
         for field_spec in reversed(order_by):
