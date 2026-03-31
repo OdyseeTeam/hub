@@ -60,7 +60,9 @@ class ElasticSyncService(BlockchainReaderService):
         self.synchronized = asyncio.Event()
         self._listeners: typing.List[ElasticNotifierProtocol] = []
         self._force_reindex = False
-        self._pending_claims = None
+        self._pending_claims: typing.Optional[PendingClaimIndex] = getattr(
+            self, "_pending_claims", None
+        )
         self._mempool_claim_hashes = set()
         self._last_mempool_tx_hashes: typing.Set[bytes] = set()
         self._last_mempool_height = -1

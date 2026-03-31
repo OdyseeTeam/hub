@@ -212,19 +212,23 @@ class SearchIndex:
                 for r in await self._get_referenced_rows(total_referenced)
             ]
             pending_claims = getattr(self.hub_db, "pending_claims", None)
-            if pending_claims and kwargs.get("offset", 0) == 0:
+            has_pending_response = any(row.height <= 0 for row in response)
+            if (
+                pending_claims
+                and kwargs.get("offset", 0) == 0
+                and not has_pending_response
+            ):
                 pending_rows, pending_extra = pending_claims.search(kwargs)
                 if pending_rows:
-                    confirmed_hashes = {row.claim_hash for row in response}
-                    pending_hashes = {row.claim_hash for row in pending_rows}
-                    response = pending_rows + [
-                        row for row in response if row.claim_hash not in pending_hashes
-                    ]
-                    response = response[: kwargs.get("limit", 10)]
-                    total += sum(
-                        1
-                        for row in pending_rows
-                        if row.claim_hash not in confirmed_hashes
+                    existing_hashes = {row.claim_hash for row in response}
+                    merged = {}
+                    for row in pending_rows:
+                        merged[row.claim_hash] = row
+                    for row in response:
+                        merged.setdefault(row.claim_hash, row)
+                    response = list(merged.values())[: kwargs.get("limit", 10)]
+                    total += len(
+                        {row.claim_hash for row in pending_rows} - existing_hashes
                     )
                 if pending_extra:
                     seen_extra = {row.claim_hash for row in extra}
@@ -238,6 +242,36 @@ class SearchIndex:
     async def get_many(self, *claim_ids):
         await self.populate_claim_cache(*claim_ids)
         return filter(None, map(self.claim_cache.get, claim_ids))
+
+    async def get_many_from_hits(self, hit_refs):
+        requested = list(hit_refs)
+        if not requested:
+            return []
+
+        ids_by_index = {
+            self.mempool_index: [],
+            self.index: [],
+        }
+        for claim_id, _, hit_index in requested:
+            ids_by_index[hit_index].append(claim_id)
+
+        fetched = {}
+        for index_name, claim_ids in ids_by_index.items():
+            if not claim_ids:
+                continue
+            results = await self.search_client.mget(
+                index=index_name, body={"ids": claim_ids}
+            )
+            for result in expand_result(
+                filter(lambda doc: doc["found"], results["docs"])
+            ):
+                fetched[(result["claim_id"], index_name)] = result
+
+        return [
+            fetched[(claim_id, hit_index)]
+            for claim_id, _, hit_index in requested
+            if (claim_id, hit_index) in fetched
+        ]
 
     async def populate_claim_cache(self, *claim_ids):
         missing = [
@@ -303,7 +337,7 @@ class SearchIndex:
                         ],
                     )
                     search_hits = deque(es_resp["hits"]["hits"])
-                    search_hits = self.__prefer_mempool_versions(search_hits)
+                    search_hits = await self.__prefer_mempool_versions(search_hits)
                     if self.timeout_counter and es_resp["timed_out"]:
                         self.timeout_counter.inc()
                     if remove_duplicates:
@@ -314,23 +348,30 @@ class SearchIndex:
                         )
                     else:
                         reordered_hits = [
-                            (hit["_id"], hit["_source"]["channel_id"])
+                            (
+                                hit["_id"],
+                                hit["_source"]["channel_id"],
+                                hit["_index"],
+                            )
                             for hit in search_hits
                         ]
                     cache_item.result = reordered_hits
-        result = list(
-            await self.get_many(
-                *(
-                    claim_id
-                    for claim_id, _ in reordered_hits[offset : (offset + page_size)]
-                )
-            )
+        result = await self.get_many_from_hits(
+            reordered_hits[offset : (offset + page_size)]
         )
         return result, 0, len(reordered_hits)
 
-    def __prefer_mempool_versions(self, search_hits: deque) -> deque:
+    async def __prefer_mempool_versions(self, search_hits: deque) -> deque:
+        confirmed_ids = [
+            hit["_id"] for hit in search_hits if hit.get("_index") == self.index
+        ]
+        if not confirmed_ids:
+            return search_hits
+        mempool_results = await self.search_client.mget(
+            index=self.mempool_index, body={"ids": confirmed_ids}
+        )
         mempool_ids = {
-            hit["_id"] for hit in search_hits if hit.get("_index") == self.mempool_index
+            doc["_id"] for doc in mempool_results["docs"] if doc.get("found")
         }
         if not mempool_ids:
             return search_hits
@@ -373,27 +414,37 @@ class SearchIndex:
             else:
                 break  # means last page was incomplete and we are left with bad replacements
             for _ in range(len(next_page_hits_maybe_check_later)):
-                claim_id, channel_id = next_page_hits_maybe_check_later.popleft()
+                claim_id, channel_id, hit_index = (
+                    next_page_hits_maybe_check_later.popleft()
+                )
                 if (
                     per_channel_per_page > 0
                     and channel_counters[channel_id] < per_channel_per_page
                 ):
-                    reordered_hits.append((claim_id, channel_id))
+                    reordered_hits.append((claim_id, channel_id, hit_index))
                     channel_counters[channel_id] += 1
                 else:
-                    next_page_hits_maybe_check_later.append((claim_id, channel_id))
+                    next_page_hits_maybe_check_later.append(
+                        (claim_id, channel_id, hit_index)
+                    )
             while search_hits:
                 hit = search_hits.popleft()
-                hit_id, hit_channel_id = hit["_id"], hit["_source"]["channel_id"]
+                hit_id, hit_channel_id, hit_index = (
+                    hit["_id"],
+                    hit["_source"]["channel_id"],
+                    hit["_index"],
+                )
                 if hit_channel_id is None or per_channel_per_page <= 0:
-                    reordered_hits.append((hit_id, hit_channel_id))
+                    reordered_hits.append((hit_id, hit_channel_id, hit_index))
                 elif channel_counters[hit_channel_id] < per_channel_per_page:
-                    reordered_hits.append((hit_id, hit_channel_id))
+                    reordered_hits.append((hit_id, hit_channel_id, hit_index))
                     channel_counters[hit_channel_id] += 1
                     if len(reordered_hits) % page_size == 0:
                         break
                 else:
-                    next_page_hits_maybe_check_later.append((hit_id, hit_channel_id))
+                    next_page_hits_maybe_check_later.append(
+                        (hit_id, hit_channel_id, hit_index)
+                    )
         return reordered_hits
 
     async def _get_referenced_rows(self, txo_rows: List[dict]):

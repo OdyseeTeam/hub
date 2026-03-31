@@ -1340,9 +1340,7 @@ class LBRYElectrumX(asyncio.Protocol):
                     for hashX, history in mempool_histories.items()
                     if history
                 }
-            return await self.db.get_hashX_statuses(
-                hashXes, mempool_histories or None
-            )
+            return await self.db.get_hashX_statuses(hashXes, mempool_histories or None)
         return [await self.get_hashX_status(hashX) for hashX in hashXes]
 
     async def _send_history_notifications(self, hashXes: typing.List[bytes]):
@@ -1932,7 +1930,7 @@ class LBRYElectrumX(asyncio.Protocol):
             self.txs_sent += 1
             try:
                 touched = await asyncio.get_event_loop().run_in_executor(
-                    self.db._executor,
+                    None,
                     self.mempool.inject_transaction,
                     bytes.fromhex(hex_hash)[::-1],
                     bytes.fromhex(raw_tx),
@@ -1940,9 +1938,7 @@ class LBRYElectrumX(asyncio.Protocol):
                 if touched:
                     self.session_manager.clear_caches()
                     self.session_manager.search_index.clear_caches()
-                    await self.mempool.on_mempool(
-                        set(), touched, self.db.db_height
-                    )
+                    await self.mempool.on_mempool(set(), touched, self.db.db_height)
             except Exception:
                 self.logger.exception(
                     "failed to inject broadcast tx %s into live mempool state",

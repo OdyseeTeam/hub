@@ -2487,12 +2487,13 @@ class ResolveAfterReorg(BaseResolveTestCase):
 
     async def test_pending_claim_search_by_claim_id_with_release_time_order(self):
         name = "ordered-mempool-hovercraft"
+        release_time = 4102444800
 
         tx = await self.daemon.jsonrpc_stream_create(
             name,
             "1.0",
             file_path=self.create_upload_file(data=b"hi!"),
-            release_time="2100-01-01T00:00:00Z",
+            release_time=release_time,
             blocking=False,
         )
 
@@ -2600,6 +2601,113 @@ class ResolveAfterReorg(BaseResolveTestCase):
         )
 
         await self.ledger.wait(tx)
+
+    async def test_pending_stream_update_search_uses_new_metadata(self):
+        created = await self.stream_create(
+            name="pending-update-stream",
+            tags=["old-update-tag"],
+            title="Old Pending Update Title",
+        )
+        claim_id = created["outputs"][0]["claim_id"]
+
+        old_results = await self.claim_search(
+            claim_id=claim_id,
+            claim_type=["stream"],
+            any_tags=["old-update-tag"],
+        )
+        self.assertEqual(1, len(old_results))
+        self.assertEqual(created["txid"], old_results[0]["txid"])
+
+        tx = await self.daemon.jsonrpc_stream_update(
+            claim_id,
+            title="New Pending Update Title",
+            clear_tags=True,
+            tags=["new-update-tag"],
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        resolved = await self.resolve("pending-update-stream")
+        self.assertEqual(tx.id, resolved["txid"])
+        self.assertEqual(0, resolved["height"])
+        self.assertEqual("New Pending Update Title", resolved["value"]["title"])
+        self.assertListEqual(["new-update-tag"], resolved["value"]["tags"])
+
+        new_results = await self.claim_search(
+            claim_id=claim_id,
+            claim_type=["stream"],
+            any_tags=["new-update-tag"],
+        )
+        self.assertEqual(1, len(new_results))
+        self.assertEqual(tx.id, new_results[0]["txid"])
+        self.assertEqual(0, new_results[0]["height"])
+
+        old_results = await self.claim_search(
+            claim_id=claim_id,
+            claim_type=["stream"],
+            any_tags=["old-update-tag"],
+        )
+        self.assertListEqual([], old_results)
+
+    async def test_pending_collection_update_search_uses_new_collection_data(self):
+        first = await self.stream_create(name="collection-member-a")
+        second = await self.stream_create(name="collection-member-b")
+        third = await self.stream_create(name="collection-member-c")
+        first_claim_id = first["outputs"][0]["claim_id"]
+        second_claim_id = second["outputs"][0]["claim_id"]
+        third_claim_id = third["outputs"][0]["claim_id"]
+
+        created = await self.collection_create(
+            name="pending-update-collection",
+            claims=[first_claim_id],
+            tags=["old-collection-tag"],
+            title="Old Pending Collection Title",
+        )
+        claim_id = created["outputs"][0]["claim_id"]
+
+        old_results = await self.claim_search(
+            claim_id=claim_id,
+            claim_type=["collection"],
+            any_tags=["old-collection-tag"],
+        )
+        self.assertEqual(1, len(old_results))
+        self.assertEqual(created["txid"], old_results[0]["txid"])
+
+        tx = await self.daemon.jsonrpc_collection_update(
+            claim_id,
+            title="New Pending Collection Title",
+            clear_tags=True,
+            tags=["new-collection-tag"],
+            clear_claims=True,
+            claims=[second_claim_id, third_claim_id],
+            blocking=False,
+        )
+        await self.ledger.wait(tx)
+
+        resolved = await self.resolve("pending-update-collection")
+        self.assertEqual(tx.id, resolved["txid"])
+        self.assertEqual(0, resolved["height"])
+        self.assertEqual("New Pending Collection Title", resolved["value"]["title"])
+        self.assertListEqual(
+            [second_claim_id, third_claim_id], resolved["value"]["claims"]
+        )
+        self.assertListEqual(["new-collection-tag"], resolved["value"]["tags"])
+
+        new_results = await self.claim_search(
+            claim_id=claim_id,
+            claim_type=["collection"],
+            any_tags=["new-collection-tag"],
+        )
+        self.assertEqual(1, len(new_results))
+        self.assertEqual(tx.id, new_results[0]["txid"])
+        self.assertEqual(0, new_results[0]["height"])
+
+        old_results = await self.claim_search(
+            claim_id=claim_id,
+            claim_type=["collection"],
+            any_tags=["old-collection-tag"],
+        )
+        self.assertListEqual([], old_results)
 
 
 def generate_signed_legacy(address: bytes, output: Output):
