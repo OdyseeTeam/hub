@@ -6,6 +6,7 @@
 /.coverage*
 /venv
 scribe.egg-info
+hub.egg-info
 __pycache__
 /tests/.coverage.*
 /.vscode

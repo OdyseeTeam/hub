@@ -113,15 +113,23 @@ class PendingClaimIndex:
             return None
 
         if parsed.has_stream_in_channel:
-            channel_hash, _ = self._select_claim_hash(
+            channel_hash, channel_is_pending = self._select_claim_hash(
                 parsed.channel, channel_only=True, include_confirmed=True
             )
             if not channel_hash:
+                return None
+            if channel_is_pending and not self._should_return_pending(
+                channel_hash, parsed.channel
+            ):
                 return None
             stream_hash, stream_is_pending = self._select_claim_hash(
                 parsed.stream, channel_hash=channel_hash, include_confirmed=True
             )
             if not stream_hash or not stream_is_pending:
+                return None
+            if not self._should_return_pending_in_channel(
+                stream_hash, channel_hash, parsed.stream
+            ):
                 return None
             return self._expand_claim(stream_hash, channel_hash=channel_hash)
 
@@ -131,6 +139,8 @@ class PendingClaimIndex:
             )
             if not claim_hash or not is_pending:
                 return None
+            if not self._should_return_pending(claim_hash, parsed.channel):
+                return None
             return self._expand_claim(claim_hash)
 
         if parsed.has_stream:
@@ -139,9 +149,40 @@ class PendingClaimIndex:
             )
             if not claim_hash or not is_pending:
                 return None
+            if not self._should_return_pending(claim_hash, parsed.stream):
+                return None
             return self._expand_claim(claim_hash)
 
         return None
+
+    def _should_return_pending(self, claim_hash: bytes, segment: PathSegment) -> bool:
+        if segment.claim_id:
+            return True
+        if self.db.get_claim_txo(claim_hash) is not None:
+            return True
+        try:
+            normalized = normalize_name(segment.name)
+        except UnicodeDecodeError:
+            normalized = segment.name
+        return self.db.prefix_db.claim_takeover.get(normalized) is None
+
+    def _should_return_pending_in_channel(
+        self,
+        claim_hash: bytes,
+        channel_hash: bytes,
+        segment: typing.Optional[PathSegment] = None,
+    ) -> bool:
+        if segment and segment.claim_id:
+            return True
+        if self.db.get_claim_txo(claim_hash) is not None:
+            return True
+        record = self.claims_by_hash.get(claim_hash)
+        if not record:
+            return False
+        confirmed_stream = self.db._resolve_claim_in_channel(
+            channel_hash, record.claim.normalized_name
+        )
+        return confirmed_stream is None
 
     def search(
         self, kwargs: dict
@@ -768,6 +809,7 @@ class PendingClaimIndex:
                     spent_claims[claim_hash] = previous_claim
                     self.removed_claim_hashes.add(claim_hash)
                     self.touched_names.add(previous_claim.normalized_name)
+                    self.pending_channel_keys.pop(claim_hash, None)
                     if (
                         previous_claim.signing_hash
                         and previous_claim.channel_signature_is_valid

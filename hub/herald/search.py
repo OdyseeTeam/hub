@@ -212,19 +212,30 @@ class SearchIndex:
                 for r in await self._get_referenced_rows(total_referenced)
             ]
             pending_claims = getattr(self.hub_db, "pending_claims", None)
-            if pending_claims and kwargs.get("offset", 0) == 0:
+            if (
+                pending_claims
+                and kwargs.get("offset", 0) == 0
+                and not kwargs.get("limit_claims_per_channel")
+                and not kwargs.get("remove_duplicates")
+            ):
                 pending_rows, pending_extra = pending_claims.search(kwargs)
                 if pending_rows:
                     existing_hashes = {row.claim_hash for row in response}
-                    merged = {}
-                    for row in pending_rows:
-                        merged[row.claim_hash] = row
+                    pending_by_hash = {row.claim_hash: row for row in pending_rows}
+                    new_pending = [
+                        row
+                        for row in pending_rows
+                        if row.claim_hash not in existing_hashes
+                    ]
+                    updated_response = []
                     for row in response:
-                        merged.setdefault(row.claim_hash, row)
-                    response = list(merged.values())[: kwargs.get("limit", 10)]
-                    total += len(
-                        {row.claim_hash for row in pending_rows} - existing_hashes
-                    )
+                        updated_response.append(
+                            pending_by_hash.get(row.claim_hash, row)
+                        )
+                    response = (new_pending + updated_response)[
+                        : kwargs.get("limit", 10)
+                    ]
+                    total += len(new_pending)
                 if pending_extra:
                     seen_extra = {row.claim_hash for row in extra}
                     extra.extend(
