@@ -9,6 +9,7 @@ from typing import List, NamedTuple
 
 from lbry.crypto.base58 import Base58
 from lbry.crypto.hash import sha256
+from lbry.schema.claim import Claim
 from lbry.testcase import CommandTestCase
 from lbry.wallet.transaction import Output, Transaction
 
@@ -2600,6 +2601,80 @@ class ResolveAfterReorg(BaseResolveTestCase):
         self.assertEqual(0, search_results[0]["height"])
         self.assertEqual("@mempool", search_results[0]["signing_channel"]["name"])
 
+    async def test_pending_channel_and_signed_stream_both_in_mempool(self):
+        channel_name = "@pending-both"
+        stream_name = "signed-to-pending-channel"
+        extra_funding_address = (
+            await self.account.receiving.get_or_create_usable_address()
+        )
+        await self.send_to_address_and_wait(
+            extra_funding_address, 1, blocks_to_generate=1
+        )
+
+        channel_tx = await self.daemon.jsonrpc_channel_create(
+            channel_name, "0.01", blocking=False
+        )
+        channel_output = channel_tx.outputs[0]
+        channel_id = channel_output.claim_id
+
+        file_path = self.create_upload_file(data=b"hi!")
+        claim_address = await self.account.receiving.get_or_create_usable_address()
+        claim = Claim()
+        claim.stream.update(file_path=file_path, sd_hash="0" * 96)
+        stream_tx = await Transaction.claim_create(
+            stream_name,
+            claim,
+            1000000,
+            claim_address,
+            [self.account],
+            self.account,
+            channel_output,
+        )
+        file_stream = await self.daemon.file_manager.create_stream(file_path)
+        claim.stream.source.sd_hash = file_stream.sd_hash
+        stream_tx.outputs[0].script.generate()
+        stream_tx.outputs[0].sign(channel_output)
+        await stream_tx.sign([self.account])
+        await self.daemon.broadcast_or_release(stream_tx, blocking=False)
+
+        for _ in range(30):
+            resolved_channel = await self.resolve(channel_name)
+            resolved_stream = await self.resolve(f"{channel_name}/{stream_name}")
+            if (
+                resolved_channel.get("txid") == channel_tx.id
+                and resolved_stream.get("txid") == stream_tx.id
+            ):
+                self.assertEqual(0, resolved_channel["height"])
+                self.assertEqual(0, resolved_channel["confirmations"])
+                self.assertEqual(0, resolved_stream["height"])
+                self.assertEqual(0, resolved_stream["confirmations"])
+                self.assertEqual(
+                    channel_name, resolved_stream["signing_channel"]["name"]
+                )
+                self.assertTrue(resolved_stream["is_channel_signature_valid"])
+                break
+            await asyncio.sleep(0.2)
+        else:
+            self.fail("pending channel/stream pair did not become visible via resolve")
+
+        search_results = await self.claim_search(name=stream_name, channel=channel_name)
+        self.assertEqual(1, len(search_results))
+        self.assertEqual(stream_tx.id, search_results[0]["txid"])
+        self.assertEqual(0, search_results[0]["height"])
+        self.assertEqual(channel_name, search_results[0]["signing_channel"]["name"])
+        self.assertTrue(search_results[0]["is_channel_signature_valid"])
+
+        id_search_results = await self.claim_search(
+            claim_type=["stream"], channel_ids=[channel_id]
+        )
+        found = [row for row in id_search_results if row["txid"] == stream_tx.id]
+        self.assertEqual(1, len(found))
+        self.assertEqual(channel_name, found[0]["signing_channel"]["name"])
+        self.assertTrue(found[0]["is_channel_signature_valid"])
+
+        await self.ledger.wait(channel_tx)
+        await self.ledger.wait(stream_tx)
+
     async def test_pending_claim_search_with_es_style_filters(self):
         channel = await self.channel_create("@mempool-filters")
         channel_id = channel["outputs"][0]["claim_id"]
@@ -2904,32 +2979,41 @@ class ResolveAfterReorg(BaseResolveTestCase):
         """Broad filter-only pending searches should scan pending claims, not require a seed selector."""
         matching = await self.daemon.jsonrpc_stream_create(
             "filter-only-pending-match",
-            "1.0",
+            "0.01",
             file_path=self.create_upload_file(data=b"data"),
             tags=["filter-only-match-tag"],
             release_time=4102444800,
             blocking=False,
         )
-        await self.daemon.jsonrpc_stream_create(
-            "filter-only-pending-miss",
-            "1.0",
-            file_path=self.create_upload_file(data=b"data"),
-            tags=["filter-only-other-tag"],
-            release_time=4102444700,
-            blocking=False,
-        )
+        for _ in range(30):
+            resolved = await self.resolve("filter-only-pending-match")
+            if resolved.get("txid") == matching.id:
+                self.assertEqual(0, resolved["height"])
+                self.assertEqual(0, resolved["confirmations"])
+                break
+            await asyncio.sleep(0.2)
+        else:
+            self.fail("pending claim did not become visible via resolve")
 
         results = await self.claim_search(
             claim_type=["stream"],
             any_tags=["filter-only-match-tag"],
             has_source=True,
-            release_time=[">4102444790"],
+            release_time=[f">={4102444800 - 360}"],
             order_by=["release_time"],
         )
         self.assertEqual(1, len(results))
         self.assertEqual(matching.id, results[0]["txid"])
         self.assertEqual(0, results[0]["height"])
         self.assertEqual(0, results[0]["confirmations"])
+
+        results = await self.claim_search(
+            claim_type=["stream"],
+            any_tags=["filter-only-other-tag"],
+            has_source=True,
+            release_time=[f">={4102444800 - 360}"],
+        )
+        self.assertListEqual([], results)
 
         await self.ledger.wait(matching)
 

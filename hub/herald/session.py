@@ -288,6 +288,7 @@ class SessionManager:
 
     def clear_caches(self):
         self.resolve_cache.clear()
+        self.db.short_url_cache.clear()
 
     def update_history_caches(self, touched_hashXs: typing.List[bytes]):
         update_history_cache = {}

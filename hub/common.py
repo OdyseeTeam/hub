@@ -539,7 +539,10 @@ class LargestValueCache:
     def set(self, key, value) -> bool:
         if self._capacity == 0:
             return False
-        if self.full:
+        if key in self._cache:
+            old_value = self._cache[key]
+            self._raw_cache.remove(LargestValueCacheItem(key, old_value))
+        elif self.full:
             if len(value) < len(self._raw_cache[0].value):
                 return False
             popped = self._raw_cache.popleft()

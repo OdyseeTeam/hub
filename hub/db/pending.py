@@ -60,6 +60,21 @@ class PendingClaimIndex:
         for tx_hash, raw_tx in raw_mempool.items():
             self.tx_by_hash[tx_hash] = Deserializer(raw_tx).read_tx()
 
+        # Pre-scan for channel public keys so streams signed by pending
+        # channels can validate even if processed before their channel tx.
+        for tx_hash, tx in self.tx_by_hash.items():
+            for nout, txo in enumerate(tx.outputs):
+                if txo.is_claim or txo.is_update:
+                    meta = self._safe_metadata(txo)
+                    if meta and meta.is_channel:
+                        if txo.is_claim:
+                            claim_hash = hash160(tx_hash + pack(">I", nout))[::-1]
+                        else:
+                            claim_hash = txo.claim.claim_hash[::-1]
+                        self.pending_channel_keys[claim_hash] = (
+                            meta.channel.public_key_bytes
+                        )
+
         remaining = set(self.tx_by_hash)
         next_tx_num = self.db.db_tx_count + 1
         while remaining:

@@ -143,6 +143,9 @@ class SecondaryDB:
         self.tx_num_mapping: Dict[bytes, int] = {}
         self.pending_claims = None
         self.live_mempool = None
+        self.short_url_cache = LRUCacheWithMetrics(
+            2**16, metric_name="short_url", namespace=NAMESPACE
+        )
 
         self.genesis_bytes = bytes.fromhex(self.coin.GENESIS_HASH)
 
@@ -206,6 +209,9 @@ class SecondaryDB:
         root_tx_num: int,
         root_position: int,
     ) -> str:
+        cached = self.short_url_cache.get(claim_hash)
+        if cached:
+            return cached
         claim_id = claim_hash.hex()
         for prefix_len in range(10):
             for k in self.prefix_db.claim_short_id.iterate(
@@ -213,10 +219,13 @@ class SecondaryDB:
                 include_value=False,
             ):
                 if k.root_tx_num == root_tx_num and k.root_position == root_position:
-                    return f"{name}#{k.partial_claim_id}"
+                    result = f"{name}#{k.partial_claim_id}"
+                    self.short_url_cache[claim_hash] = result
+                    return result
                 break
-        print(f"{claim_id} has a collision")
-        return f"{name}#{claim_id}"
+        result = f"{name}#{claim_id}"
+        self.short_url_cache[claim_hash] = result
+        return result
 
     def _prepare_resolve_result(
         self,
@@ -875,22 +884,22 @@ class SecondaryDB:
             )
         }
 
-        # collect the short urls
-        # TODO: consider a dedicated index for this query to make it multi_get-able
+        # collect the short urls in a single executor call
+        def _batch_short_urls():
+            return {
+                claim_hash: self.get_short_claim_id_url(
+                    claim.name,
+                    claim.normalized_name,
+                    claim_hash,
+                    claim.root_tx_num,
+                    claim.root_position,
+                )
+                for claim_hash, claim in claims.items()
+                if claim is not None
+            }
+
         run_in_executor = asyncio.get_event_loop().run_in_executor
-        short_urls = {
-            claim_hash: await run_in_executor(
-                self._executor,
-                self.get_short_claim_id_url,
-                claim.name,
-                claim.normalized_name,
-                claim_hash,
-                claim.root_tx_num,
-                claim.root_position,
-            )
-            for claim_hash, claim in claims.items()
-            if claim is not None
-        }
+        short_urls = await run_in_executor(self._executor, _batch_short_urls)
         # collect all of the activation heights for the accumulated claims
         activations_needed = {
             (1, claim_txo.tx_num, claim_txo.position): claim_hash

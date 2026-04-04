@@ -385,6 +385,9 @@ class ElasticSyncService(BlockchainReaderService):
         )
         if not changed:
             return
+        await self.sync_client.indices.create(
+            self.mempool_index, INDEX_DEFAULT_SETTINGS, ignore=400
+        )
         previous_claim_hashes = self._mempool_claim_hashes
         current_claim_hashes = set(self._pending_claims.claims_by_hash)
         deleted_claims = previous_claim_hashes.difference(current_claim_hashes)
@@ -436,7 +439,13 @@ class ElasticSyncService(BlockchainReaderService):
             else:
                 success += 1
         self._mempool_claim_docs = current_docs
-        await self.sync_client.indices.refresh(self.mempool_index)
+        try:
+            await self.sync_client.indices.refresh(self.mempool_index)
+        except NotFoundError:
+            await self.sync_client.indices.create(
+                self.mempool_index, INDEX_DEFAULT_SETTINGS, ignore=400
+            )
+            await self.sync_client.indices.refresh(self.mempool_index)
         self.log.info(
             "Indexed mempool overlay claims. %i/%i successful, %i pending claims",
             success,
