@@ -64,7 +64,7 @@ class ServerEnv(Env):
         self.hashX_history_cache_size = address_history_cache_size if address_history_cache_size is not None \
             else self.integer('ADDRESS_HISTORY_CACHE_SIZE', 4096)
         self.largest_hashX_history_cache_size = largest_address_history_cache_size if largest_address_history_cache_size is not None \
-            else self.integer('LARGEST_ADDRESS_HISTORY_CACHE_SIZE', 256)
+            else self.integer('LARGEST_ADDRESS_HISTORY_CACHE_SIZE', 1024)
 
         self.daemon_ca_path = daemon_ca_path if daemon_ca_path else None
         self.merkle_cache_size = merkle_cache_size if merkle_cache_size is not None else self.integer('MERKLE_CACHE_SIZE', 32768)

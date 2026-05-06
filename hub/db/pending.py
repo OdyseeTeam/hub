@@ -1,0 +1,1240 @@
+import time as _time
+import typing
+from bisect import bisect_right
+from collections import defaultdict
+from dataclasses import dataclass
+from struct import pack
+
+from hub.common import StagedClaimtrieItem, hash160
+from hub.db.common import ExpandedResolveResult, ResolveResult
+from hub.schema.mime_types import guess_stream_type
+from hub.schema.url import URL, PathSegment, normalize_name
+from hub.scribe.transaction import Tx, TxOutput
+from hub.scribe.transaction.deserializer import Deserializer
+
+if typing.TYPE_CHECKING:
+    from hub.db import SecondaryDB
+
+
+@dataclass
+class PendingClaimRecord:
+    claim: StagedClaimtrieItem
+    tx_hash: bytes
+    tx: Tx
+
+
+class PendingClaimIndex:
+    def __init__(self, db: "SecondaryDB"):
+        self.db = db
+        self.coin = db.coin
+        self.clear()
+
+    def clear(self):
+        self.raw_mempool: typing.Dict[bytes, bytes] = {}
+        self.tx_by_hash: typing.Dict[bytes, Tx] = {}
+        self.tx_num_by_hash: typing.Dict[bytes, int] = {}
+        self.tx_hash_by_num: typing.Dict[int, bytes] = {}
+        self.claims_by_hash: typing.Dict[bytes, PendingClaimRecord] = {}
+        self.pending_claims_by_name: typing.DefaultDict[str, typing.Set[bytes]] = (
+            defaultdict(set)
+        )
+        self.pending_claims_by_channel: typing.DefaultDict[
+            typing.Tuple[bytes, str], typing.Set[bytes]
+        ] = defaultdict(set)
+        self.pending_channel_keys: typing.Dict[bytes, bytes] = {}
+        self.support_delta: typing.DefaultDict[bytes, int] = defaultdict(int)
+        self.channel_count_delta: typing.DefaultDict[bytes, int] = defaultdict(int)
+        self.reposted_delta: typing.DefaultDict[bytes, int] = defaultdict(int)
+        self.removed_claim_hashes: typing.Set[bytes] = set()
+        self.touched_names: typing.Set[str] = set()
+        self.effective_amounts: typing.Dict[bytes, int] = {}
+        self.support_amounts: typing.Dict[bytes, int] = {}
+        self.controlling_claims: typing.Dict[str, bytes] = {}
+        self.parsed_tx_cache: typing.Dict[bytes, Tx] = {}
+
+    def rebuild(self, raw_mempool: typing.Dict[bytes, bytes]):
+        self.clear()
+        if not raw_mempool:
+            return
+        self.raw_mempool = dict(raw_mempool)
+        for tx_hash, raw_tx in raw_mempool.items():
+            self.tx_by_hash[tx_hash] = Deserializer(raw_tx).read_tx()
+
+        # Pre-scan for channel public keys so streams signed by pending
+        # channels can validate even if processed before their channel tx.
+        for tx_hash, tx in self.tx_by_hash.items():
+            for nout, txo in enumerate(tx.outputs):
+                if txo.is_claim or txo.is_update:
+                    meta = self._safe_metadata(txo)
+                    if meta and meta.is_channel:
+                        if txo.is_claim:
+                            claim_hash = hash160(tx_hash + pack(">I", nout))[::-1]
+                        else:
+                            claim_hash = txo.claim.claim_hash[::-1]
+                        self.pending_channel_keys[claim_hash] = (
+                            meta.channel.public_key_bytes
+                        )
+
+        remaining = set(self.tx_by_hash)
+        next_tx_num = self.db.db_tx_count + 1
+        while remaining:
+            ready = sorted(
+                tx_hash
+                for tx_hash in remaining
+                if all(
+                    txi.prev_hash not in remaining
+                    for txi in self.tx_by_hash[tx_hash].inputs
+                    if not txi.is_generation()
+                )
+            )
+            if not ready:
+                ready = [sorted(remaining)[0]]
+            for tx_hash in ready:
+                self.tx_num_by_hash[tx_hash] = next_tx_num
+                self.tx_hash_by_num[next_tx_num] = tx_hash
+                next_tx_num += 1
+                self._apply_transaction(tx_hash, self.tx_by_hash[tx_hash])
+                remaining.remove(tx_hash)
+        self._finalize()
+
+    def has_pending_claims(self) -> bool:
+        return bool(self.claims_by_hash)
+
+    def get_tx_hash(self, tx_num: int) -> typing.Optional[bytes]:
+        return self.tx_hash_by_num.get(tx_num)
+
+    def get_tx_num(self, tx_hash: bytes) -> typing.Optional[int]:
+        return self.tx_num_by_hash.get(tx_hash)
+
+    def resolve(self, url: str) -> typing.Optional[ExpandedResolveResult]:
+        try:
+            parsed = URL.parse(url)
+        except ValueError:
+            return None
+
+        if parsed.has_stream_in_channel:
+            channel_hash, channel_is_pending = self._select_claim_hash(
+                parsed.channel, channel_only=True, include_confirmed=True
+            )
+            if not channel_hash:
+                return None
+            if channel_is_pending and not self._should_return_pending(
+                channel_hash, parsed.channel
+            ):
+                return None
+            stream_hash, stream_is_pending = self._select_claim_hash(
+                parsed.stream, channel_hash=channel_hash, include_confirmed=True
+            )
+            if not stream_hash or not stream_is_pending:
+                return None
+            if not self._should_return_pending_in_channel(
+                stream_hash, channel_hash, parsed.stream
+            ):
+                return None
+            return self._expand_claim(stream_hash, channel_hash=channel_hash)
+
+        if parsed.has_channel:
+            claim_hash, is_pending = self._select_claim_hash(
+                parsed.channel, channel_only=True, include_confirmed=True
+            )
+            if not claim_hash or not is_pending:
+                return None
+            if not self._should_return_pending(claim_hash, parsed.channel):
+                return None
+            return self._expand_claim(claim_hash)
+
+        if parsed.has_stream:
+            claim_hash, is_pending = self._select_claim_hash(
+                parsed.stream, include_confirmed=True
+            )
+            if not claim_hash or not is_pending:
+                return None
+            if not self._should_return_pending(claim_hash, parsed.stream):
+                return None
+            return self._expand_claim(claim_hash)
+
+        return None
+
+    def _should_return_pending(self, claim_hash: bytes, segment: PathSegment) -> bool:
+        if segment.claim_id:
+            return True
+        if self.db.get_claim_txo(claim_hash) is not None:
+            return True
+        try:
+            normalized = normalize_name(segment.name)
+        except UnicodeDecodeError:
+            normalized = segment.name
+        return self.db.prefix_db.claim_takeover.get(normalized) is None
+
+    def _should_return_pending_in_channel(
+        self,
+        claim_hash: bytes,
+        channel_hash: bytes,
+        segment: typing.Optional[PathSegment] = None,
+    ) -> bool:
+        if segment and segment.claim_id:
+            return True
+        if self.db.get_claim_txo(claim_hash) is not None:
+            return True
+        record = self.claims_by_hash.get(claim_hash)
+        if not record:
+            return False
+        confirmed_stream = self.db._resolve_claim_in_channel(
+            channel_hash, record.claim.normalized_name
+        )
+        return confirmed_stream is None
+
+    def search(
+        self, kwargs: dict
+    ) -> typing.Tuple[typing.List[ResolveResult], typing.List[ResolveResult]]:
+        if kwargs.get("offset"):
+            return [], []
+
+        supported = {
+            "name",
+            "claim_id",
+            "claim_ids",
+            "txid",
+            "nout",
+            "channel_id",
+            "channel_ids",
+            "not_channel_ids",
+            "is_controlling",
+            "claim_type",
+            "has_channel_signature",
+            "valid_channel_signature",
+            "invalid_channel_signature",
+            "any_tags",
+            "all_tags",
+            "not_tags",
+            "release_time",
+            "creation_timestamp",
+            "has_source",
+            "has_no_source",
+            "stream_types",
+            "duration",
+            "fee_amount",
+            "fee_currency",
+            "content_aspect_ratio",
+            "any_languages",
+            "all_languages",
+            "media_types",
+            "not_claim_id",
+            "exclude_shorts",
+            "exclude_shorts_aspect_ratio_lte",
+            "exclude_shorts_duration_lte",
+            "text",
+            "amount_order",
+            "signature_valid",
+            "limit",
+            "offset",
+            "order_by",
+            "remove_duplicates",
+            "no_totals",
+            "index",
+            "limit_claims_per_channel",
+        }
+        if any(key not in supported for key in kwargs):
+            return [], []
+
+        candidate_hashes: typing.Optional[typing.Set[bytes]] = None
+
+        def decode_hex_bytes(value: str) -> typing.Optional[bytes]:
+            try:
+                return bytes.fromhex(value)
+            except (TypeError, ValueError):
+                return None
+
+        def decode_hex_set(values) -> typing.Optional[typing.Set[bytes]]:
+            decoded = set()
+            for value in values:
+                item = decode_hex_bytes(value)
+                if item is None:
+                    return None
+                decoded.add(item)
+            return decoded
+
+        def intersect(matches: typing.Iterable[bytes]):
+            nonlocal candidate_hashes
+            matches = set(matches)
+            if candidate_hashes is None:
+                candidate_hashes = matches
+            else:
+                candidate_hashes.intersection_update(matches)
+
+        if kwargs.get("name"):
+            try:
+                intersect(self.pending_claims_by_name[normalize_name(kwargs["name"])])
+            except UnicodeDecodeError:
+                intersect(self.pending_claims_by_name[kwargs["name"]])
+        if kwargs.get("claim_id"):
+            claim_prefix = kwargs["claim_id"]
+            intersect(
+                claim_hash
+                for claim_hash in self.claims_by_hash
+                if claim_hash.hex().startswith(claim_prefix)
+            )
+        if kwargs.get("claim_ids"):
+            wanted = set(kwargs["claim_ids"])
+            intersect(
+                claim_hash
+                for claim_hash in self.claims_by_hash
+                if claim_hash.hex() in wanted
+            )
+        if kwargs.get("txid"):
+            tx_hash = decode_hex_bytes(kwargs["txid"])
+            if tx_hash is None:
+                return [], []
+            tx_hash = tx_hash[::-1]
+            tx_num = self.tx_num_by_hash.get(tx_hash)
+            if tx_num is not None and kwargs.get("nout") is not None:
+                claim_hash = self._claim_hash_for_txo(
+                    tx_hash,
+                    int(kwargs["nout"]),
+                    self.tx_by_hash[tx_hash].outputs[int(kwargs["nout"])],
+                )
+                if claim_hash in self.claims_by_hash:
+                    intersect([claim_hash])
+                else:
+                    intersect([])
+        if kwargs.get("channel_id"):
+            channel_hash = decode_hex_bytes(kwargs["channel_id"])
+            if channel_hash is None:
+                return [], []
+            intersect(
+                claim_hash
+                for (
+                    signing_hash,
+                    _,
+                ), claim_hashes in self.pending_claims_by_channel.items()
+                if signing_hash == channel_hash
+                for claim_hash in claim_hashes
+            )
+        if kwargs.get("channel_ids"):
+            channel_hashes = decode_hex_set(kwargs["channel_ids"])
+            if channel_hashes is None:
+                return [], []
+            intersect(
+                claim_hash
+                for (
+                    signing_hash,
+                    _,
+                ), claim_hashes in self.pending_claims_by_channel.items()
+                if signing_hash in channel_hashes
+                for claim_hash in claim_hashes
+            )
+        if kwargs.get("not_claim_id"):
+            not_ids = kwargs["not_claim_id"]
+            if isinstance(not_ids, str):
+                not_ids = [not_ids]
+            excluded = set()
+            for nid in not_ids:
+                decoded = decode_hex_bytes(nid)
+                if decoded:
+                    excluded.add(decoded)
+            if candidate_hashes is not None:
+                candidate_hashes.difference_update(excluded)
+            else:
+                candidate_hashes = set(self.claims_by_hash) - excluded
+        if candidate_hashes is None:
+            candidate_hashes = set(self.claims_by_hash)
+
+        rows = []
+        extras = {}
+        for claim_hash in candidate_hashes:
+            record = self.claims_by_hash.get(claim_hash)
+            if not record:
+                continue
+            if not self._matches_search(record, kwargs):
+                continue
+            resolved = self._make_resolve_result(claim_hash)
+            if not resolved:
+                continue
+            rows.append((resolved, record))
+            if resolved.channel_hash:
+                extra = self._get_claim_result(resolved.channel_hash)
+                if extra:
+                    extras[extra.claim_hash] = extra
+            if resolved.reposted_claim_hash:
+                extra = self._get_claim_result(resolved.reposted_claim_hash)
+                if extra:
+                    extras[extra.claim_hash] = extra
+                    if extra.channel_hash:
+                        repost_channel = self._get_claim_result(extra.channel_hash)
+                        if repost_channel:
+                            extras[repost_channel.claim_hash] = repost_channel
+
+        amount_order = kwargs.get("amount_order")
+        if amount_order:
+            rows.sort(
+                key=lambda item: (
+                    -item[0].effective_amount,
+                    item[0].tx_num,
+                    item[0].position,
+                )
+            )
+            offset = max(0, int(amount_order) - 1)
+            return (
+                [rows[offset][0]] if offset < len(rows) else [],
+                list(extras.values()),
+            )
+        self._sort_search_rows(rows, kwargs)
+        limit = kwargs.get("limit", 10)
+        return [row for row, _ in rows[:limit]], list(extras.values())
+
+    def _resolve_effective_metadata(self, record: PendingClaimRecord, metadata):
+        """For reposts, resolve the reposted claim's metadata for field projection."""
+        if not metadata or not metadata.is_repost:
+            return metadata
+        reposted_hash = metadata.repost.reference.claim_hash[::-1]
+        reposted = self._get_claim_result(reposted_hash)
+        if not reposted:
+            return metadata
+        # Try pending tx first, then confirmed
+        reposted_tx = self.tx_by_hash.get(reposted.tx_hash)
+        if reposted_tx is None:
+            reposted_tx = self.parsed_tx_cache.get(reposted.tx_hash)
+        if reposted_tx is None:
+            raw = self.db.get_raw_tx(reposted.tx_hash)
+            if raw:
+                reposted_tx = self.coin.transaction(raw)
+                self.parsed_tx_cache[reposted.tx_hash] = reposted_tx
+        if reposted_tx and reposted.position < len(reposted_tx.outputs):
+            return self._safe_metadata(reposted_tx.outputs[reposted.position])
+        return metadata
+
+    def _matches_search(self, record: PendingClaimRecord, kwargs: dict) -> bool:
+        claim = record.claim
+        claim_type = kwargs.get("claim_type")
+        metadata = self._safe_metadata(record.tx.outputs[claim.position])
+        # For filters that project reposted-claim fields (has_source, stream_types,
+        # duration, fee, aspect_ratio, media_types), use the reposted claim's metadata
+        effective_metadata = self._resolve_effective_metadata(record, metadata)
+        if claim_type:
+            claim_types = (
+                claim_type
+                if isinstance(claim_type, (list, tuple, set))
+                else [claim_type]
+            )
+            pending_type = self._pending_claim_type(claim, metadata)
+            if pending_type not in claim_types:
+                return False
+        if (
+            kwargs.get("is_controlling")
+            and self.controlling_claims.get(claim.normalized_name) != claim.claim_hash
+        ):
+            return False
+        if kwargs.get("not_channel_ids"):
+            try:
+                not_channel_hashes = {
+                    bytes.fromhex(channel_id)
+                    for channel_id in kwargs["not_channel_ids"]
+                }
+            except (TypeError, ValueError):
+                return False
+            if claim.signing_hash in not_channel_hashes:
+                return False
+        has_signature = claim.signing_hash is not None
+        if kwargs.get("has_channel_signature") and not has_signature:
+            return False
+        if (
+            kwargs.get("valid_channel_signature")
+            and not claim.channel_signature_is_valid
+        ):
+            return False
+        if kwargs.get("invalid_channel_signature") and (
+            not has_signature or claim.channel_signature_is_valid
+        ):
+            return False
+        tags = self._metadata_tags(metadata)
+        if metadata and metadata.is_repost and effective_metadata is not metadata:
+            tags = tags.union(self._metadata_tags(effective_metadata))
+        any_tags = kwargs.get("any_tags")
+        if any_tags and not tags.intersection(any_tags):
+            return False
+        all_tags = kwargs.get("all_tags")
+        if all_tags and not set(all_tags).issubset(tags):
+            return False
+        not_tags = kwargs.get("not_tags")
+        if not_tags and tags.intersection(not_tags):
+            return False
+        has_source = kwargs.get("has_source")
+        if has_source is not None:
+            if self._metadata_has_source(effective_metadata) != has_source:
+                return False
+        has_no_source = kwargs.get("has_no_source")
+        if has_no_source is not None:
+            if self._metadata_has_source(effective_metadata) == has_no_source:
+                return False
+        release_time = kwargs.get("release_time")
+        if release_time and not self._matches_range(
+            self._metadata_release_time(record, metadata), release_time
+        ):
+            return False
+        creation_timestamp = kwargs.get("creation_timestamp")
+        if creation_timestamp and not self._matches_range(
+            self._metadata_creation_timestamp(record), creation_timestamp
+        ):
+            return False
+        stream_types = kwargs.get("stream_types")
+        if stream_types:
+            actual_stream_type = self._metadata_stream_type(effective_metadata)
+            if actual_stream_type not in stream_types:
+                return False
+        duration = kwargs.get("duration")
+        if duration and not self._matches_range(
+            self._metadata_duration(effective_metadata), duration
+        ):
+            return False
+        fee_amount = kwargs.get("fee_amount")
+        if fee_amount and not self._matches_range(
+            self._metadata_fee_amount(effective_metadata), fee_amount
+        ):
+            return False
+        fee_currency = kwargs.get("fee_currency")
+        if fee_currency:
+            if (
+                self._metadata_fee_currency(effective_metadata).upper()
+                != fee_currency.upper()
+            ):
+                return False
+        content_aspect_ratio = kwargs.get("content_aspect_ratio")
+        if content_aspect_ratio and not self._matches_range_float(
+            self._metadata_aspect_ratio(effective_metadata), content_aspect_ratio
+        ):
+            return False
+        any_languages = kwargs.get("any_languages")
+        if any_languages:
+            claim_languages = self._metadata_languages(metadata)
+            if metadata and metadata.is_repost and effective_metadata is not metadata:
+                claim_languages = claim_languages.union(
+                    self._metadata_languages(effective_metadata)
+                )
+            if not claim_languages.intersection(any_languages):
+                return False
+        all_languages = kwargs.get("all_languages")
+        if all_languages:
+            claim_languages = self._metadata_languages(metadata)
+            if metadata and metadata.is_repost and effective_metadata is not metadata:
+                claim_languages = claim_languages.union(
+                    self._metadata_languages(effective_metadata)
+                )
+            if not set(all_languages).issubset(claim_languages):
+                return False
+        media_types = kwargs.get("media_types")
+        if media_types:
+            actual_media_type = self._metadata_media_type(effective_metadata)
+            if actual_media_type not in media_types:
+                return False
+        signature_valid = kwargs.get("signature_valid")
+        if signature_valid is not None:
+            has_sig = claim.signing_hash is not None
+            if signature_valid and not claim.channel_signature_is_valid:
+                return False
+            if not signature_valid and has_sig and claim.channel_signature_is_valid:
+                return False
+        if kwargs.get("exclude_shorts"):
+            aspect = self._metadata_aspect_ratio(effective_metadata)
+            dur = self._metadata_duration(effective_metadata)
+            max_aspect = kwargs.get("exclude_shorts_aspect_ratio_lte", 0.95)
+            max_dur = kwargs.get("exclude_shorts_duration_lte", 180)
+            if aspect and dur and aspect <= max_aspect and dur <= max_dur:
+                return False
+        text_query = kwargs.get("text")
+        if text_query:
+            if not self._matches_text(claim, metadata, text_query):
+                return False
+        return True
+
+    def _pending_claim_type(self, claim: StagedClaimtrieItem, metadata) -> str:
+        if claim.name.startswith("@"):
+            return "channel"
+        if metadata and getattr(metadata, "is_repost", False):
+            return "repost"
+        if metadata and getattr(metadata, "is_collection", False):
+            return "collection"
+        if metadata and getattr(metadata, "is_claimreference", False):
+            return "claimreference"
+        return "stream"
+
+    def _metadata_tags(self, metadata) -> typing.Set[str]:
+        if not metadata:
+            return set()
+        if metadata.is_stream:
+            return set(metadata.stream.tags)
+        if metadata.is_channel:
+            return set(metadata.channel.tags)
+        if metadata.is_collection:
+            return set(metadata.collection.tags)
+        if metadata.is_repost:
+            return set(metadata.repost.tags)
+        return set()
+
+    def _metadata_has_source(self, metadata) -> bool:
+        return bool(metadata and metadata.is_stream and metadata.stream.has_source)
+
+    def _metadata_release_time(self, record: PendingClaimRecord, metadata) -> int:
+        if metadata and metadata.is_stream:
+            release_time = metadata.stream.release_time or 0
+            if isinstance(release_time, str):
+                return self._metadata_creation_timestamp(record)
+            return (
+                int(release_time)
+                if release_time
+                else self._metadata_creation_timestamp(record)
+            )
+        # Non-stream types (repost, collection) use creation_timestamp, matching ES
+        return self._metadata_creation_timestamp(record)
+
+    def _metadata_creation_timestamp(self, record: PendingClaimRecord) -> int:
+        claim = record.claim
+        if claim.root_tx_num > self.db.db_tx_count:
+            return int(_time.time())
+        creation_height = bisect_right(self.db.tx_counts, claim.root_tx_num)
+        if creation_height <= 0:
+            return int(_time.time())
+        header = self.db.prefix_db.header.get(creation_height, deserialize_value=False)
+        if not header:
+            return 0
+        return int.from_bytes(header[100:104], byteorder="little")
+
+    def _metadata_stream_type(self, metadata) -> str:
+        if not metadata or not metadata.is_stream or not metadata.stream.has_source:
+            return ""
+        return guess_stream_type(metadata.stream.source.media_type)
+
+    def _metadata_duration(self, metadata) -> int:
+        if not metadata or not metadata.is_stream:
+            return 0
+        return metadata.stream.video.duration or metadata.stream.audio.duration or 0
+
+    def _metadata_fee_amount(self, metadata) -> int:
+        if not metadata or not metadata.is_stream or not metadata.stream.has_fee:
+            return 0
+        return int(max(metadata.stream.fee.amount or 0, 0) * 1000)
+
+    def _metadata_fee_currency(self, metadata) -> str:
+        if not metadata or not metadata.is_stream or not metadata.stream.has_fee:
+            return ""
+        return metadata.stream.fee.currency or ""
+
+    def _metadata_aspect_ratio(self, metadata) -> float:
+        if (
+            not metadata
+            or not metadata.is_stream
+            or not metadata.stream.video
+            or not metadata.stream.video.height
+            or not metadata.stream.video.width
+        ):
+            return 0.0
+        return metadata.stream.video.width / metadata.stream.video.height
+
+    def _metadata_media_type(self, metadata) -> str:
+        if not metadata or not metadata.is_stream or not metadata.stream.has_source:
+            return ""
+        return metadata.stream.source.media_type or ""
+
+    def _matches_text(self, claim: StagedClaimtrieItem, metadata, query: str) -> bool:
+        query_lower = query.lower()
+        if query_lower in claim.name.lower():
+            return True
+        if not metadata:
+            return False
+        if metadata.is_stream:
+            meta = metadata.stream
+        elif metadata.is_channel:
+            meta = metadata.channel
+        elif metadata.is_collection:
+            meta = metadata.collection
+        elif metadata.is_repost:
+            meta = metadata.repost
+        else:
+            return False
+        if hasattr(meta, "title") and meta.title and query_lower in meta.title.lower():
+            return True
+        if (
+            hasattr(meta, "description")
+            and meta.description
+            and query_lower in meta.description.lower()
+        ):
+            return True
+        if (
+            hasattr(meta, "author")
+            and meta.author
+            and query_lower in meta.author.lower()
+        ):
+            return True
+        if any(query_lower in tag.lower() for tag in meta.tags):
+            return True
+        return False
+
+    def _metadata_languages(self, metadata) -> typing.Set[str]:
+        if not metadata:
+            return set()
+        if metadata.is_stream:
+            meta = metadata.stream
+        elif metadata.is_channel:
+            meta = metadata.channel
+        elif metadata.is_collection:
+            meta = metadata.collection
+        elif metadata.is_repost:
+            meta = metadata.repost
+        else:
+            return set()
+        langs = {lang.language or "none" for lang in meta.languages}
+        return langs or {"none"}
+
+    def _matches_range_float(self, actual: float, constraints) -> bool:
+        if isinstance(constraints, str):
+            constraints = [constraints]
+        for constraint in constraints:
+            if not constraint:
+                continue
+            operator = (
+                constraint[:2] if constraint[:2] in {">=", "<="} else constraint[:1]
+            )
+            value = float(constraint[len(operator) :])
+            if operator == ">" and not actual > value:
+                return False
+            if operator == ">=" and not actual >= value:
+                return False
+            if operator == "<" and not actual < value:
+                return False
+            if operator == "<=" and not actual <= value:
+                return False
+        return True
+
+    def _matches_range(self, actual: int, constraints) -> bool:
+        if isinstance(constraints, str):
+            constraints = [constraints]
+        for constraint in constraints:
+            if not constraint:
+                continue
+            operator = (
+                constraint[:2] if constraint[:2] in {">=", "<="} else constraint[:1]
+            )
+            value = int(constraint[len(operator) :])
+            if operator == ">" and not actual > value:
+                return False
+            if operator == ">=" and not actual >= value:
+                return False
+            if operator == "<" and not actual < value:
+                return False
+            if operator == "<=" and not actual <= value:
+                return False
+        return True
+
+    def _sort_search_rows(
+        self,
+        rows: typing.List[typing.Tuple[ResolveResult, PendingClaimRecord]],
+        kwargs: dict,
+    ):
+        order_by = kwargs.get("order_by") or []
+        if isinstance(order_by, str):
+            order_by = [order_by]
+        if not order_by:
+            rows.sort(
+                key=lambda item: (
+                    -item[0].effective_amount,
+                    item[0].tx_num,
+                    item[0].position,
+                )
+            )
+            return
+
+        metadata_by_claim_hash = {
+            record.claim.claim_hash: self._safe_metadata(
+                record.tx.outputs[record.claim.position]
+            )
+            for _, record in rows
+        }
+
+        def key_for_field(
+            field: str, item: typing.Tuple[ResolveResult, PendingClaimRecord]
+        ):
+            row, record = item
+            metadata = metadata_by_claim_hash.get(record.claim.claim_hash)
+            if field == "release_time":
+                return self._metadata_release_time(record, metadata)
+            if field == "creation_timestamp":
+                return self._metadata_creation_timestamp(record)
+            if field == "name":
+                return row.normalized_name
+            if field == "height":
+                return row.height
+            if field == "amount":
+                return row.amount
+            if field == "effective_amount":
+                return row.effective_amount
+            if field == "support_amount":
+                return row.support_amount
+            if field == "tx_num":
+                return row.tx_num
+            if field in (
+                "trending_group",
+                "trending_mixed",
+                "trending_local",
+                "trending_global",
+            ):
+                return 0
+            return getattr(row, field, 0)
+
+        for field_spec in reversed(order_by):
+            ascending = field_spec.startswith("^")
+            field = field_spec[1:] if ascending else field_spec
+            rows.sort(
+                key=lambda item: key_for_field(field, item), reverse=not ascending
+            )
+
+    def _apply_transaction(self, tx_hash: bytes, tx: Tx):
+        spent_claims = {}
+        first_input = tx.inputs[0] if tx.inputs else None
+        for txi in tx.inputs:
+            if txi.is_generation():
+                continue
+            prev_txo = self._get_prev_txo(txi.prev_hash, txi.prev_idx)
+            if prev_txo is None:
+                continue
+            if prev_txo.is_claim or prev_txo.is_update:
+                claim_hash = self._claim_hash_for_txo(
+                    txi.prev_hash, txi.prev_idx, prev_txo
+                )
+                previous_record = self.claims_by_hash.pop(claim_hash, None)
+                if previous_record:
+                    self._remove_pending_claim(previous_record.claim)
+                    previous_claim = previous_record.claim
+                else:
+                    previous_claim = self._get_confirmed_claim(claim_hash)
+                if previous_claim:
+                    spent_claims[claim_hash] = previous_claim
+                    self.removed_claim_hashes.add(claim_hash)
+                    self.touched_names.add(previous_claim.normalized_name)
+                    self.pending_channel_keys.pop(claim_hash, None)
+                    if (
+                        previous_claim.signing_hash
+                        and previous_claim.channel_signature_is_valid
+                    ):
+                        self.channel_count_delta[previous_claim.signing_hash] -= 1
+                    if previous_claim.reposted_claim_hash:
+                        self.reposted_delta[previous_claim.reposted_claim_hash] -= 1
+            elif prev_txo.is_support:
+                supported_claim_hash = prev_txo.support.claim_hash[::-1]
+                self.support_delta[supported_claim_hash] -= prev_txo.value
+
+        tx_num = self.tx_num_by_hash[tx_hash]
+        for nout, txo in enumerate(tx.outputs):
+            if txo.is_claim or txo.is_update:
+                pending = self._build_pending_claim(
+                    tx_hash, tx_num, tx, nout, txo, spent_claims, first_input
+                )
+                if pending:
+                    self.claims_by_hash[pending.claim.claim_hash] = pending
+                    self._index_pending_claim(pending.claim)
+                    self.removed_claim_hashes.discard(pending.claim.claim_hash)
+            elif txo.is_support:
+                self._apply_support(txo)
+
+    def _apply_support(self, txo: TxOutput):
+        supported_claim_hash = txo.support.claim_hash[::-1]
+        try:
+            normalized_name = normalize_name(txo.support.name.decode())
+        except UnicodeDecodeError:
+            normalized_name = "".join(chr(x) for x in txo.support.name)
+        supported_claim = self.claims_by_hash.get(supported_claim_hash)
+        if supported_claim:
+            if supported_claim.claim.normalized_name != normalized_name:
+                return
+        else:
+            confirmed = self.db.get_claim_txo(supported_claim_hash)
+            if not confirmed or confirmed.normalized_name != normalized_name:
+                return
+        self.support_delta[supported_claim_hash] += txo.value
+        self.touched_names.add(normalized_name)
+
+    def _build_pending_claim(
+        self,
+        tx_hash: bytes,
+        tx_num: int,
+        tx: Tx,
+        nout: int,
+        txo: TxOutput,
+        spent_claims: dict,
+        first_input,
+    ) -> typing.Optional[PendingClaimRecord]:
+        try:
+            claim_name = txo.claim.name.decode()
+        except UnicodeDecodeError:
+            claim_name = "".join(chr(c) for c in txo.claim.name)
+        try:
+            normalized_name = normalize_name(claim_name)
+        except UnicodeDecodeError:
+            normalized_name = claim_name
+
+        if txo.is_claim:
+            claim_hash = hash160(tx_hash + pack(">I", nout))[::-1]
+            root_tx_num, root_position = tx_num, nout
+        else:
+            claim_hash = txo.claim.claim_hash[::-1]
+            previous = spent_claims.pop(claim_hash, None)
+            if not previous or previous.normalized_name != normalized_name:
+                return None
+            claim_name = previous.name
+            root_tx_num, root_position = previous.root_tx_num, previous.root_position
+
+        signing_channel_hash = None
+        channel_signature_is_valid = False
+        reposted_claim_hash = None
+
+        metadata = self._safe_metadata(txo)
+        if metadata:
+            if metadata.is_repost:
+                reposted_claim_hash = metadata.repost.reference.claim_hash[::-1]
+                self.reposted_delta[reposted_claim_hash] += 1
+            if metadata.is_channel:
+                self.pending_channel_keys[claim_hash] = (
+                    metadata.channel.public_key_bytes
+                )
+            if metadata.is_signed:
+                signing_channel_hash = metadata.signing_channel_hash[::-1]
+                channel_signature_is_valid = self._is_valid_signature(
+                    signing_channel_hash, txo, first_input
+                )
+
+        claim = StagedClaimtrieItem(
+            claim_name,
+            normalized_name,
+            claim_hash,
+            txo.value,
+            self.coin.get_expiration_height(self.db.db_height + 1),
+            tx_num,
+            nout,
+            root_tx_num,
+            root_position,
+            channel_signature_is_valid,
+            signing_channel_hash,
+            reposted_claim_hash,
+        )
+        self.touched_names.add(normalized_name)
+        return PendingClaimRecord(claim, tx_hash, tx)
+
+    def _is_valid_signature(
+        self, signing_channel_hash: typing.Optional[bytes], txo: TxOutput, first_input
+    ) -> bool:
+        if not signing_channel_hash or first_input is None:
+            return False
+        channel_pub_key_bytes = self.pending_channel_keys.get(signing_channel_hash)
+        if channel_pub_key_bytes is None:
+            signing_channel = self.db.get_claim_txo(signing_channel_hash)
+            if signing_channel:
+                channel_tx_hash = self.db.get_tx_hash(signing_channel.tx_num)
+                channel_tx = self.parsed_tx_cache.get(channel_tx_hash)
+                if channel_tx is None:
+                    raw_channel_tx = self.db.get_raw_tx(channel_tx_hash)
+                    if raw_channel_tx:
+                        channel_tx = self.coin.transaction(raw_channel_tx)
+                        self.parsed_tx_cache[channel_tx_hash] = channel_tx
+                if channel_tx is not None:
+                    try:
+                        channel_pub_key_bytes = channel_tx.outputs[
+                            signing_channel.position
+                        ].metadata.channel.public_key_bytes
+                    except Exception:
+                        channel_pub_key_bytes = None
+        if channel_pub_key_bytes is None:
+            return False
+        try:
+            return self.coin.verify_signed_metadata(
+                channel_pub_key_bytes, txo, first_input
+            )
+        except Exception:
+            return False
+
+    def _safe_metadata(self, txo: TxOutput):
+        try:
+            return txo.metadata
+        except Exception:
+            return None
+
+    def _index_pending_claim(self, claim: StagedClaimtrieItem):
+        self.pending_claims_by_name[claim.normalized_name].add(claim.claim_hash)
+        if claim.signing_hash and claim.channel_signature_is_valid:
+            self.pending_claims_by_channel[
+                (claim.signing_hash, claim.normalized_name)
+            ].add(claim.claim_hash)
+            self.channel_count_delta[claim.signing_hash] += 1
+
+    def _remove_pending_claim(self, claim: StagedClaimtrieItem):
+        pending = self.pending_claims_by_name.get(claim.normalized_name)
+        if pending and claim.claim_hash in pending:
+            pending.remove(claim.claim_hash)
+            if not pending:
+                self.pending_claims_by_name.pop(claim.normalized_name, None)
+        if claim.signing_hash and claim.channel_signature_is_valid:
+            key = (claim.signing_hash, claim.normalized_name)
+            pending = self.pending_claims_by_channel.get(key)
+            if pending and claim.claim_hash in pending:
+                pending.remove(claim.claim_hash)
+                if not pending:
+                    self.pending_claims_by_channel.pop(key, None)
+
+    def _finalize(self):
+        touched_names = set(self.touched_names).union(self.pending_claims_by_name)
+        for claim_hash, record in list(self.claims_by_hash.items()):
+            support_amount = max(
+                0,
+                self.db.get_support_amount(claim_hash)
+                + self.support_delta.get(claim_hash, 0),
+            )
+            self.support_amounts[claim_hash] = support_amount
+            self.effective_amounts[claim_hash] = record.claim.amount + support_amount
+
+        for name in touched_names:
+            best = None
+            best_key = None
+            combined = set(self.db.get_claims_for_name(name)).union(
+                self.pending_claims_by_name.get(name, set())
+            )
+            for claim_hash in combined:
+                if claim_hash in self.claims_by_hash:
+                    tx_num = self.claims_by_hash[claim_hash].claim.tx_num
+                    position = self.claims_by_hash[claim_hash].claim.position
+                    amount = self.effective_amounts.get(claim_hash, 0)
+                else:
+                    if claim_hash in self.removed_claim_hashes:
+                        continue
+                    claim = self.db.get_claim_txo(claim_hash)
+                    if not claim:
+                        continue
+                    tx_num = claim.tx_num
+                    position = claim.position
+                    amount = self.db.get_effective_amount(claim_hash)
+                key = (amount, -tx_num, -position)
+                if best is None or key > best_key:
+                    best = claim_hash
+                    best_key = key
+            if best is not None:
+                self.controlling_claims[name] = best
+
+    def _select_claim_hash(
+        self,
+        segment: PathSegment,
+        channel_hash: typing.Optional[bytes] = None,
+        channel_only: bool = False,
+        include_confirmed: bool = False,
+    ) -> typing.Tuple[typing.Optional[bytes], bool]:
+        name = segment.normalized
+        if channel_hash is None:
+            pending = set(self.pending_claims_by_name.get(name, set()))
+            confirmed = (
+                set(self.db.get_claims_for_name(name)) if include_confirmed else set()
+            )
+        else:
+            pending = set(
+                self.pending_claims_by_channel.get((channel_hash, name), set())
+            )
+            confirmed = (
+                set(
+                    claim_hash
+                    for (claim_hash,) in self.db.prefix_db.channel_to_claim.iterate(
+                        prefix=(channel_hash, name), include_key=False
+                    )
+                )
+                if include_confirmed
+                else set()
+            )
+
+        if channel_only:
+            pending = {
+                claim_hash
+                for claim_hash in pending
+                if self._claim_name(claim_hash).startswith("@")
+            }
+            confirmed = {
+                claim_hash
+                for claim_hash in confirmed
+                if self._claim_name(claim_hash).startswith("@")
+            }
+
+        candidates = pending.union(confirmed)
+        if segment.claim_id:
+            candidates = {
+                claim_hash
+                for claim_hash in candidates
+                if claim_hash.hex().startswith(segment.claim_id)
+            }
+
+        ordered = sorted(
+            candidates,
+            key=lambda claim_hash: self._claim_sort_key(claim_hash),
+            reverse=True,
+        )
+        order = max(int(segment.amount_order or 1), 1)
+        if len(ordered) < order:
+            return None, False
+        selected = ordered[order - 1]
+        return selected, selected in self.claims_by_hash
+
+    def _claim_sort_key(self, claim_hash: bytes):
+        if claim_hash in self.claims_by_hash:
+            claim = self.claims_by_hash[claim_hash].claim
+            return (
+                self.effective_amounts.get(claim_hash, 0),
+                -claim.tx_num,
+                -claim.position,
+            )
+        claim = self.db.get_claim_txo(claim_hash)
+        if not claim:
+            return -1, 0, 0
+        return self.db.get_effective_amount(claim_hash), -claim.tx_num, -claim.position
+
+    def _claim_name(self, claim_hash: bytes) -> str:
+        if claim_hash in self.claims_by_hash:
+            return self.claims_by_hash[claim_hash].claim.name
+        claim = self.db.get_claim_txo(claim_hash)
+        return "" if not claim else claim.name
+
+    def _expand_claim(
+        self, claim_hash: bytes, channel_hash: typing.Optional[bytes] = None
+    ) -> ExpandedResolveResult:
+        stream = self._get_claim_result(claim_hash)
+        if not stream:
+            return ExpandedResolveResult(None, None, None, None)
+        channel_hash = channel_hash or stream.channel_hash
+        channel = self._get_claim_result(channel_hash) if channel_hash else None
+        repost = (
+            self._get_claim_result(stream.reposted_claim_hash)
+            if stream.reposted_claim_hash
+            else None
+        )
+        reposted_channel = (
+            self._get_claim_result(repost.channel_hash)
+            if repost and repost.channel_hash
+            else None
+        )
+        if stream.name.startswith("@") and not channel:
+            return ExpandedResolveResult(None, stream, repost, reposted_channel)
+        return ExpandedResolveResult(stream, channel, repost, reposted_channel)
+
+    def _get_claim_result(
+        self, claim_hash: typing.Optional[bytes]
+    ) -> typing.Optional[ResolveResult]:
+        if not claim_hash:
+            return None
+        if claim_hash in self.claims_by_hash:
+            return self._make_resolve_result(claim_hash)
+        return self.db._fs_get_claim_by_hash(claim_hash)
+
+    def _make_resolve_result(self, claim_hash: bytes) -> typing.Optional[ResolveResult]:
+        record = self.claims_by_hash.get(claim_hash)
+        if not record:
+            return None
+        claim = record.claim
+        short_url = f"{claim.name}#{claim_hash.hex()[:10]}"
+        canonical_url = short_url
+        channel_hash = claim.signing_hash if claim.channel_signature_is_valid else None
+        channel_tx_hash = channel_height = channel_tx_position = None
+        if channel_hash:
+            channel = self._get_claim_result(channel_hash)
+            if channel:
+                channel_tx_hash = channel.tx_hash
+                channel_tx_position = channel.position
+                channel_height = channel.height
+                canonical_url = f"{channel.short_url}/{short_url}"
+        reposted_tx_hash = reposted_height = reposted_tx_position = None
+        if claim.reposted_claim_hash:
+            repost = self._get_claim_result(claim.reposted_claim_hash)
+            if repost:
+                reposted_tx_hash = repost.tx_hash
+                reposted_tx_position = repost.position
+                reposted_height = repost.height
+        if claim.root_tx_num > self.db.db_tx_count:
+            creation_height = 0
+        else:
+            creation_height = bisect_right(self.db.tx_counts, claim.root_tx_num)
+        controlling = self.controlling_claims.get(claim.normalized_name)
+        controlling_height = self.db.get_controlling_claim(claim.normalized_name)
+        claims_in_channel = self.db.get_claims_in_channel_count(
+            claim_hash
+        ) + self.channel_count_delta.get(claim_hash, 0)
+        return ResolveResult(
+            claim.name,
+            claim.normalized_name,
+            claim_hash,
+            claim.tx_num,
+            claim.position,
+            record.tx_hash,
+            0,
+            claim.amount,
+            short_url,
+            controlling == claim_hash,
+            canonical_url,
+            creation_height,
+            0,
+            0,
+            self.effective_amounts.get(claim_hash, claim.amount),
+            self.support_amounts.get(
+                claim_hash, self.db.get_support_amount(claim_hash)
+            ),
+            self.db.get_reposted_count(claim_hash)
+            + self.reposted_delta.get(claim_hash, 0),
+            0
+            if controlling == claim_hash and not controlling_height
+            else (None if not controlling_height else controlling_height.height),
+            claims_in_channel,
+            channel_hash,
+            claim.reposted_claim_hash,
+            claim.channel_signature_is_valid if channel_hash else None,
+            reposted_tx_hash,
+            reposted_tx_position,
+            reposted_height,
+            channel_tx_hash,
+            channel_tx_position,
+            channel_height,
+        )
+
+    def _get_prev_txo(self, tx_hash: bytes, nout: int) -> typing.Optional[TxOutput]:
+        tx = self.tx_by_hash.get(tx_hash)
+        if tx is None:
+            tx = self.parsed_tx_cache.get(tx_hash)
+        if tx is None:
+            raw_tx = self.db.get_raw_tx(tx_hash)
+            if not raw_tx:
+                return None
+            tx = self.coin.transaction(raw_tx)
+            self.parsed_tx_cache[tx_hash] = tx
+        if nout >= len(tx.outputs):
+            return None
+        return tx.outputs[nout]
+
+    def _get_confirmed_claim(
+        self, claim_hash: bytes
+    ) -> typing.Optional[StagedClaimtrieItem]:
+        claim = self.db.get_claim_txo(claim_hash)
+        if not claim:
+            return None
+        signing_hash = self.db.get_channel_for_claim(
+            claim_hash, claim.tx_num, claim.position
+        )
+        reposted_claim_hash = self.db.get_repost(claim_hash)
+        return StagedClaimtrieItem(
+            claim.name,
+            claim.normalized_name,
+            claim_hash,
+            claim.amount,
+            self.coin.get_expiration_height(
+                bisect_right(self.db.tx_counts, claim.tx_num)
+            ),
+            claim.tx_num,
+            claim.position,
+            claim.root_tx_num,
+            claim.root_position,
+            claim.channel_signature_is_valid,
+            signing_hash,
+            reposted_claim_hash,
+        )
+
+    @staticmethod
+    def _claim_hash_for_txo(tx_hash: bytes, nout: int, txo: TxOutput) -> bytes:
+        if txo.is_claim:
+            return hash160(tx_hash + pack(">I", nout))[::-1]
+        return txo.claim.claim_hash[::-1]

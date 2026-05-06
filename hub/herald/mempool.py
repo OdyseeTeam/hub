@@ -1,19 +1,24 @@
 import asyncio
 import itertools
-import attr
-import typing
 import logging
+import threading
+import time
+import typing
 from collections import defaultdict
-from prometheus_client import Histogram, Gauge
+
+import attr
 import rocksdb.errors
+from prometheus_client import Gauge, Histogram
+
 from hub import PROMETHEUS_NAMESPACE
 from hub.common import HISTOGRAM_BUCKETS
 from hub.db.common import UTXO
+from hub.db.pending import PendingClaimIndex
 from hub.scribe.transaction.deserializer import Deserializer
 
 if typing.TYPE_CHECKING:
-    from hub.herald.session import SessionManager
     from hub.db import SecondaryDB
+    from hub.herald.session import SessionManager
 
 
 @attr.s(slots=True)
@@ -36,46 +41,97 @@ class MemPoolTxSummary:
 
 NAMESPACE = f"{PROMETHEUS_NAMESPACE}_hub"
 mempool_process_time_metric = Histogram(
-    "processed_mempool", "Time to process mempool and notify touched addresses",
-    namespace=NAMESPACE, buckets=HISTOGRAM_BUCKETS
+    "processed_mempool",
+    "Time to process mempool and notify touched addresses",
+    namespace=NAMESPACE,
+    buckets=HISTOGRAM_BUCKETS,
 )
-mempool_tx_count_metric = Gauge("mempool_tx_count", "Transactions in mempool", namespace=NAMESPACE)
+mempool_tx_count_metric = Gauge(
+    "mempool_tx_count", "Transactions in mempool", namespace=NAMESPACE
+)
 mempool_touched_address_count_metric = Gauge(
-    "mempool_touched_address_count", "Count of addresses touched by transactions in mempool", namespace=NAMESPACE
+    "mempool_touched_address_count",
+    "Count of addresses touched by transactions in mempool",
+    namespace=NAMESPACE,
 )
 
 
 class HubMemPool:
-    def __init__(self, coin, db: 'SecondaryDB', refresh_secs=1.0):
+    def __init__(self, coin, db: "SecondaryDB", refresh_secs=1.0):
         self.coin = coin
         self._db = db
         self.logger = logging.getLogger(__name__)
+        self.pending_claims = PendingClaimIndex(db)
+        self._db.pending_claims = self.pending_claims
+        self._db.live_mempool = self
         self.txs = {}
         self.raw_mempool = {}
+        self.injected_raw_mempool: typing.Dict[bytes, typing.Tuple[bytes, float]] = {}
         self.tx_touches = {}
-        self.touched_hashXs: typing.DefaultDict[bytes, typing.Set[bytes]] = defaultdict(set)  # None can be a key
+        self.touched_hashXs: typing.DefaultDict[bytes, typing.Set[bytes]] = defaultdict(
+            set
+        )  # None can be a key
         self.refresh_secs = refresh_secs
+        self.injected_tx_expiry_secs = 30.0
+        self._refresh_lock = threading.Lock()
         self.mempool_process_time_metric = mempool_process_time_metric
-        self.session_manager: typing.Optional['SessionManager'] = None
+        self.session_manager: typing.Optional["SessionManager"] = None
         self._notification_q = asyncio.Queue()
 
     def refresh(self) -> typing.Set[bytes]:  # returns list of new touched hashXs
         prefix_db = self._db.prefix_db
         mempool_tx_hashes = set()
+        raw_mempool = {}
         try:
-            lower, upper = prefix_db.mempool_tx.MIN_TX_HASH, prefix_db.mempool_tx.MAX_TX_HASH
+            lower, upper = (
+                prefix_db.mempool_tx.MIN_TX_HASH,
+                prefix_db.mempool_tx.MAX_TX_HASH,
+            )
             for k, v in prefix_db.mempool_tx.iterate(start=(lower,), stop=(upper,)):
-                self.raw_mempool[k.tx_hash] = v.raw_tx
+                raw_mempool[k.tx_hash] = v.raw_tx
                 mempool_tx_hashes.add(k.tx_hash)
-            for removed_mempool_tx in set(self.raw_mempool.keys()).difference(mempool_tx_hashes):
-                self.raw_mempool.pop(removed_mempool_tx)
         except rocksdb.errors.RocksIOError as err:
             # FIXME: why does this happen? can it happen elsewhere?
-            if err.args[0].startswith(b'IO error: No such file or directory: While open a file for random read:'):
+            if err.args[0].startswith(
+                b"IO error: No such file or directory: While open a file for random read:"
+            ):
                 self.logger.error("failed to process mempool, retrying later")
                 return set()
             raise err
-        # hashXs = self.hashXs  # hashX: [tx_hash, ...]
+        with self._refresh_lock:
+            now = time.monotonic()
+            for tx_hash, (_, expires_at) in list(self.injected_raw_mempool.items()):
+                if tx_hash in mempool_tx_hashes:
+                    self.injected_raw_mempool.pop(tx_hash, None)
+                    continue
+                if expires_at <= now or prefix_db.tx_num.get(tx_hash):
+                    self.injected_raw_mempool.pop(tx_hash, None)
+            raw_mempool.update(
+                {
+                    tx_hash: raw_tx
+                    for tx_hash, (raw_tx, _) in self.injected_raw_mempool.items()
+                }
+            )
+            self.raw_mempool = raw_mempool
+            return self._refresh_cached_mempool()
+
+    def inject_transaction(self, tx_hash: bytes, raw_tx: bytes) -> typing.Set[bytes]:
+        """Inject a just-broadcast tx into mempool state.
+
+        Must be called from a worker thread (via run_in_executor), never
+        directly from the event loop, because the lock may block while
+        refresh() is running.
+        """
+        with self._refresh_lock:
+            self.injected_raw_mempool[tx_hash] = (
+                raw_tx,
+                time.monotonic() + self.injected_tx_expiry_secs,
+            )
+            self.raw_mempool[tx_hash] = raw_tx
+            return self._refresh_cached_mempool()
+
+    def _refresh_cached_mempool(self) -> typing.Set[bytes]:
+        prefix_db = self._db.prefix_db
         touched_hashXs = set()
 
         # Remove txs that aren't in mempool anymore
@@ -98,13 +154,20 @@ class HubMemPool:
             tx, tx_size = Deserializer(raw_tx).read_tx_and_vsize()
             # Convert the inputs and outputs into (hashX, value) pairs
             # Drop generation-like inputs from MemPoolTx.prevouts
-            txin_pairs = tuple((txin.prev_hash, txin.prev_idx)
-                               for txin in tx.inputs
-                               if not txin.is_generation())
-            txout_pairs = tuple((self.coin.hashX_from_txo(txout), txout.value)
-                                for txout in tx.outputs if txout.pk_script)
+            txin_pairs = tuple(
+                (txin.prev_hash, txin.prev_idx)
+                for txin in tx.inputs
+                if not txin.is_generation()
+            )
+            txout_pairs = tuple(
+                (self.coin.hashX_from_txo(txout), txout.value)
+                for txout in tx.outputs
+                if txout.pk_script
+            )
 
-            tx_map[tx_hash] = MemPoolTx(None, txin_pairs, txout_pairs, 0, tx_size, raw_tx)
+            tx_map[tx_hash] = MemPoolTx(
+                None, txin_pairs, txout_pairs, 0, tx_size, raw_tx
+            )
 
         for tx_hash, tx in tx_map.items():
             prevouts = []
@@ -119,7 +182,9 @@ class HubMemPool:
                     if not prev_tx_num:
                         continue
                     prev_tx_num = prev_tx_num.tx_num
-                    hashX_val = prefix_db.hashX_utxo.get(prev_hash[:4], prev_tx_num, prev_index)
+                    hashX_val = prefix_db.hashX_utxo.get(
+                        prev_hash[:4], prev_tx_num, prev_index
+                    )
                     if not hashX_val:
                         continue
                     hashX = hashX_val.hashX
@@ -131,8 +196,9 @@ class HubMemPool:
             tx.prevouts = tuple(prevouts)
             # Avoid negative fees if dealing with generation-like transactions
             # because some in_parts would be missing
-            tx.fee = max(0, (sum(v for _, v in tx.prevouts) -
-                             sum(v for _, v in tx.out_pairs)))
+            tx.fee = max(
+                0, (sum(v for _, v in tx.prevouts) - sum(v for _, v in tx.out_pairs))
+            )
             self.txs[tx_hash] = tx
             self.tx_touches[tx_hash] = tx_touches = set()
             # print(f"added {tx_hash[::-1].hex()} reader to mempool")
@@ -144,6 +210,7 @@ class HubMemPool:
 
         mempool_tx_count_metric.set(len(self.txs))
         mempool_touched_address_count_metric.set(len(self.touched_hashXs))
+        self.pending_claims.rebuild(self.raw_mempool)
         return touched_hashXs
 
     def transaction_summaries(self, hashX):
@@ -158,11 +225,11 @@ class HubMemPool:
         return result
 
     def mempool_history(self, hashX: bytes) -> str:
-        result = ''
+        result = ""
         for tx_hash in self.touched_hashXs.get(hashX, ()):
             if tx_hash not in self.txs:
                 continue  # the tx hash for the touched address is an input that isn't in mempool anymore
-            result += f'{tx_hash[::-1].hex()}:{-any(_hash in self.txs for _hash, idx in self.txs[tx_hash].in_pairs):d}:'
+            result += f"{tx_hash[::-1].hex()}:{-any(_hash in self.txs for _hash, idx in self.txs[tx_hash].in_pairs):d}:"
         return result
 
     def unordered_UTXOs(self, hashX):
@@ -202,7 +269,7 @@ class HubMemPool:
         if hashX in self.touched_hashXs:
             for h in self.touched_hashXs[hashX]:
                 tx = self.txs[h]
-                value -= sum(v for h168, v in tx.in_pairs if h168 == hashX)
+                value -= sum(v for h168, v in tx.prevouts if h168 == hashX)
                 value += sum(v for h168, v in tx.out_pairs if h168 == hashX)
         return value
 
@@ -220,7 +287,7 @@ class HubMemPool:
             return -1
         return 0
 
-    async def start(self, height, session_manager: 'SessionManager'):
+    async def start(self, height, session_manager: "SessionManager"):
         self.session_manager = session_manager
         await self._notify_sessions(height, set(), set())
 
@@ -238,8 +305,12 @@ class HubMemPool:
             if session:
                 if session.subscribe_headers and height_changed:
                     session.send_notification(
-                        'blockchain.headers.subscribe',
-                        (self.session_manager.hsub_results[session.subscribe_headers_raw],)
+                        "blockchain.headers.subscribe",
+                        (
+                            self.session_manager.hsub_results[
+                                session.subscribe_headers_raw
+                            ],
+                        ),
                     )
 
                 if hashXes:
@@ -255,24 +326,34 @@ class HubMemPool:
             return
 
         if height_changed:
-            for hashX in touched.intersection(self.session_manager.mempool_statuses.keys()):
+            for hashX in touched.intersection(
+                self.session_manager.mempool_statuses.keys()
+            ):
                 self.session_manager.mempool_statuses.pop(hashX, None)
         # self.bp._chain_executor
         await asyncio.get_event_loop().run_in_executor(
-            self._db._executor, touched.intersection_update, self.session_manager.hashx_subscriptions_by_session.keys()
+            self._db._executor,
+            touched.intersection_update,
+            self.session_manager.hashx_subscriptions_by_session.keys(),
         )
 
         session_hashxes_to_notify = defaultdict(list)
         notified_hashxs = 0
         sent_headers = 0
 
-        if touched or new_touched or (height_changed and self.session_manager.mempool_statuses):
+        if (
+            touched
+            or new_touched
+            or (height_changed and self.session_manager.mempool_statuses)
+        ):
             to_notify = touched if height_changed else new_touched
 
             for hashX in to_notify:
                 if hashX not in self.session_manager.hashx_subscriptions_by_session:
                     continue
-                for session_id in self.session_manager.hashx_subscriptions_by_session[hashX]:
+                for session_id in self.session_manager.hashx_subscriptions_by_session[
+                    hashX
+                ]:
                     session_hashxes_to_notify[session_id].append(hashX)
                     notified_hashxs += 1
 
@@ -286,6 +367,8 @@ class HubMemPool:
                 sent_headers += 1
             self._notification_q.put_nowait((session_id, height_changed, hashXes))
         if sent_headers:
-            self.logger.info(f'notified {sent_headers} sessions of new block header')
+            self.logger.info(f"notified {sent_headers} sessions of new block header")
         if session_hashxes_to_notify:
-            self.logger.info(f'notified {len(session_hashxes_to_notify)} sessions/{notified_hashxs:,d} touched addresses')
+            self.logger.info(
+                f"notified {len(session_hashxes_to_notify)} sessions/{notified_hashxs:,d} touched addresses"
+            )

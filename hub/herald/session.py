@@ -1,38 +1,56 @@
+import asyncio
+import codecs
+import collections
+import errno
+import itertools
+import logging
+import math
 import os
 import sys
-import math
 import time
-import errno
-import codecs
 import typing
-import asyncio
-import logging
-import itertools
-import collections
-from bisect import bisect_right
 from asyncio import Event, sleep
+from bisect import bisect_right
 from collections import defaultdict, namedtuple
 from contextlib import suppress
 from functools import partial
+
 from elasticsearch import ConnectionTimeout
-from prometheus_client import Counter, Info, Histogram, Gauge
-from hub.schema.result import Outputs
-from hub.error import ResolveCensoredError, TooManyClaimSearchParametersError
-from hub import __version__, PROMETHEUS_NAMESPACE
-from hub.herald import PROTOCOL_MIN, PROTOCOL_MAX, HUB_PROTOCOL_VERSION
+from prometheus_client import Counter, Gauge, Histogram, Info
+
+from hub import PROMETHEUS_NAMESPACE, __version__
 from hub.build_info import BUILD, COMMIT_HASH, DOCKER_TAG
-from hub.herald.search import SearchIndex
-from hub.common import sha256, hash_to_hex_str, hex_str_to_hash, HASHX_LEN, version_string, formatted_time, SIZE_BUCKETS
-from hub.common import protocol_version, RPCError, DaemonError, TaskGroup, HISTOGRAM_BUCKETS, asyncify_for_loop
-from hub.common import LRUCacheWithMetrics, LFUCacheWithMetrics, LargestValueCache
-from hub.herald.jsonrpc import JSONRPCAutoDetect, JSONRPCConnection, JSONRPCv2, JSONRPC
-from hub.herald.common import BatchRequest, ProtocolError, Request, Batch, Notification
+from hub.common import (
+    HASHX_LEN,
+    HISTOGRAM_BUCKETS,
+    SIZE_BUCKETS,
+    DaemonError,
+    LargestValueCache,
+    LFUCacheWithMetrics,
+    LRUCacheWithMetrics,
+    RPCError,
+    TaskGroup,
+    asyncify_for_loop,
+    formatted_time,
+    hash_to_hex_str,
+    hex_str_to_hash,
+    protocol_version,
+    sha256,
+    version_string,
+)
+from hub.error import ResolveCensoredError, TooManyClaimSearchParametersError
+from hub.herald import HUB_PROTOCOL_VERSION, PROTOCOL_MAX, PROTOCOL_MIN
+from hub.herald.common import Batch, BatchRequest, Notification, ProtocolError, Request
 from hub.herald.framer import NewlineFramer
+from hub.herald.jsonrpc import JSONRPC, JSONRPCAutoDetect, JSONRPCConnection, JSONRPCv2
+from hub.herald.search import SearchIndex
+from hub.schema.result import Outputs
+
 if typing.TYPE_CHECKING:
     from hub.db import SecondaryDB
     from hub.herald.env import ServerEnv
-    from hub.scribe.daemon import LBCDaemon
     from hub.herald.mempool import HubMemPool
+    from hub.scribe.daemon import LBCDaemon
 
 PYTHON_VERSION = sys.version_info.major, sys.version_info.minor
 TypedDict = dict if PYTHON_VERSION < (3, 8) else typing.TypedDict
@@ -42,8 +60,9 @@ DAEMON_ERROR = 2
 log = logging.getLogger(__name__)
 
 
-SignatureInfo = namedtuple('SignatureInfo', 'min_args max_args '
-                           'required_names other_names')
+SignatureInfo = namedtuple(
+    "SignatureInfo", "min_args max_args required_names other_names"
+)
 
 
 class CachedAddressHistoryItem(TypedDict):
@@ -58,7 +77,7 @@ def scripthash_to_hashX(scripthash: str) -> bytes:
             return bin_hash[:HASHX_LEN]
     except Exception:
         pass
-    raise RPCError(BAD_REQUEST, f'{scripthash} is not a valid script hash')
+    raise RPCError(BAD_REQUEST, f"{scripthash} is not a valid script hash")
 
 
 def non_negative_integer(value) -> int:
@@ -70,15 +89,14 @@ def non_negative_integer(value) -> int:
             return value
     except ValueError:
         pass
-    raise RPCError(BAD_REQUEST,
-                   f'{value} should be a non-negative integer')
+    raise RPCError(BAD_REQUEST, f"{value} should be a non-negative integer")
 
 
 def assert_boolean(value) -> bool:
     """Return param value it is boolean otherwise raise an RPCError."""
     if value in (False, True):
         return value
-    raise RPCError(BAD_REQUEST, f'{value} should be a boolean value')
+    raise RPCError(BAD_REQUEST, f"{value} should be a boolean value")
 
 
 def assert_tx_hash(value: str) -> None:
@@ -89,7 +107,7 @@ def assert_tx_hash(value: str) -> None:
             return
     except Exception:
         pass
-    raise RPCError(BAD_REQUEST, f'{value} should be a transaction hash')
+    raise RPCError(BAD_REQUEST, f"{value} should be a transaction hash")
 
 
 class Semaphores:
@@ -110,7 +128,6 @@ class Semaphores:
 
 
 class SessionGroup:
-
     def __init__(self, gid: int):
         self.gid = gid
         # Concurrency per group
@@ -124,64 +141,109 @@ class SessionManager:
     """Holds global state about all sessions."""
 
     version_info_metric = Info(
-        'build', 'Wallet server build info (e.g. version, commit hash)', namespace=NAMESPACE
+        "build",
+        "Wallet server build info (e.g. version, commit hash)",
+        namespace=NAMESPACE,
     )
-    version_info_metric.info({
-        'build': BUILD,
-        "commit": COMMIT_HASH,
-        "docker_tag": DOCKER_TAG,
-        'version': __version__,
-        "min_version": version_string(PROTOCOL_MIN),
-        "cpu_count": str(os.cpu_count())
-    })
-    session_count_metric = Gauge("session_count", "Number of connected client sessions", namespace=NAMESPACE,
-                                 labelnames=("version",))
-    request_count_metric = Counter("requests_count", "Number of requests received", namespace=NAMESPACE,
-                                   labelnames=("method",))
-    tx_request_count_metric = Counter("requested_transaction", "Number of transactions requested", namespace=NAMESPACE)
-    tx_replied_count_metric = Counter("replied_transaction", "Number of transactions responded", namespace=NAMESPACE)
-    urls_to_resolve_count_metric = Counter("urls_to_resolve", "Number of urls to resolve", namespace=NAMESPACE)
-    resolved_url_count_metric = Counter("resolved_url", "Number of resolved urls", namespace=NAMESPACE)
+    version_info_metric.info(
+        {
+            "build": BUILD,
+            "commit": COMMIT_HASH,
+            "docker_tag": DOCKER_TAG,
+            "version": __version__,
+            "min_version": version_string(PROTOCOL_MIN),
+            "cpu_count": str(os.cpu_count()),
+        }
+    )
+    session_count_metric = Gauge(
+        "session_count",
+        "Number of connected client sessions",
+        namespace=NAMESPACE,
+        labelnames=("version",),
+    )
+    request_count_metric = Counter(
+        "requests_count",
+        "Number of requests received",
+        namespace=NAMESPACE,
+        labelnames=("method",),
+    )
+    tx_request_count_metric = Counter(
+        "requested_transaction", "Number of transactions requested", namespace=NAMESPACE
+    )
+    tx_replied_count_metric = Counter(
+        "replied_transaction", "Number of transactions responded", namespace=NAMESPACE
+    )
+    urls_to_resolve_count_metric = Counter(
+        "urls_to_resolve", "Number of urls to resolve", namespace=NAMESPACE
+    )
+    resolved_url_count_metric = Counter(
+        "resolved_url", "Number of resolved urls", namespace=NAMESPACE
+    )
     db_operational_error_metric = Counter(
-        "operational_error", "Number of queries that raised operational errors", namespace=NAMESPACE
+        "operational_error",
+        "Number of queries that raised operational errors",
+        namespace=NAMESPACE,
     )
     db_error_metric = Counter(
-        "internal_error", "Number of queries raising unexpected errors", namespace=NAMESPACE
+        "internal_error",
+        "Number of queries raising unexpected errors",
+        namespace=NAMESPACE,
     )
     executor_time_metric = Histogram(
-        "executor_time", "SQLite executor times", namespace=NAMESPACE, buckets=HISTOGRAM_BUCKETS
+        "executor_time",
+        "SQLite executor times",
+        namespace=NAMESPACE,
+        buckets=HISTOGRAM_BUCKETS,
     )
     pending_query_metric = Gauge(
-        "pending_queries_count", "Number of pending and running sqlite queries", namespace=NAMESPACE
+        "pending_queries_count",
+        "Number of pending and running sqlite queries",
+        namespace=NAMESPACE,
     )
     client_version_metric = Counter(
-        "clients", "Number of connections received per client version",
-        namespace=NAMESPACE, labelnames=("version",)
+        "clients",
+        "Number of connections received per client version",
+        namespace=NAMESPACE,
+        labelnames=("version",),
     )
     address_history_metric = Histogram(
-        "address_history", "Time to fetch an address history",
-        namespace=NAMESPACE, buckets=HISTOGRAM_BUCKETS
+        "address_history",
+        "Time to fetch an address history",
+        namespace=NAMESPACE,
+        buckets=HISTOGRAM_BUCKETS,
     )
     address_subscription_metric = Gauge(
-        "address_subscriptions", "Number of subscribed addresses",
-        namespace=NAMESPACE
+        "address_subscriptions", "Number of subscribed addresses", namespace=NAMESPACE
     )
     address_history_size_metric = Histogram(
-        "history_size", "Sizes of histories for subscribed addresses",
-        namespace=NAMESPACE, buckets=SIZE_BUCKETS
+        "history_size",
+        "Sizes of histories for subscribed addresses",
+        namespace=NAMESPACE,
+        buckets=SIZE_BUCKETS,
     )
     notifications_in_flight_metric = Gauge(
-        "notifications_in_flight", "Count of notifications in flight",
-        namespace=NAMESPACE
+        "notifications_in_flight",
+        "Count of notifications in flight",
+        namespace=NAMESPACE,
     )
     notifications_sent_metric = Histogram(
-        "notifications_sent", "Time to send an address notification",
-        namespace=NAMESPACE, buckets=HISTOGRAM_BUCKETS
+        "notifications_sent",
+        "Time to send an address notification",
+        namespace=NAMESPACE,
+        buckets=HISTOGRAM_BUCKETS,
     )
 
-    def __init__(self, env: 'ServerEnv', db: 'SecondaryDB', mempool: 'HubMemPool',
-                 daemon: 'LBCDaemon', search_index: 'SearchIndex', shutdown_event: asyncio.Event,
-                 on_available_callback: typing.Callable[[], None], on_unavailable_callback: typing.Callable[[], None]):
+    def __init__(
+        self,
+        env: "ServerEnv",
+        db: "SecondaryDB",
+        mempool: "HubMemPool",
+        daemon: "LBCDaemon",
+        search_index: "SearchIndex",
+        shutdown_event: asyncio.Event,
+        on_available_callback: typing.Callable[[], None],
+        on_unavailable_callback: typing.Callable[[], None],
+    ):
         env.max_send = max(350000, env.max_send)
         self.env = env
         self.db = db
@@ -193,14 +255,16 @@ class SessionManager:
         self.shutdown_event = shutdown_event
         self.logger = logging.getLogger(__name__)
         self.servers: typing.Dict[str, asyncio.AbstractServer] = {}
-        self.sessions: typing.Dict[int, 'LBRYElectrumX'] = {}
-        self.hashx_subscriptions_by_session: typing.DefaultDict[str, typing.Set[int]] = defaultdict(set)
+        self.sessions: typing.Dict[int, "LBRYElectrumX"] = {}
+        self.hashx_subscriptions_by_session: typing.DefaultDict[
+            str, typing.Set[int]
+        ] = defaultdict(set)
         self.mempool_statuses = {}
         self.cur_group = SessionGroup(0)
         self.txs_sent = 0
         self.start_time = time.time()
         self.resolve_cache = LRUCacheWithMetrics(
-            env.resolved_url_cache_size, metric_name='resolved_url', namespace=NAMESPACE
+            env.resolved_url_cache_size, metric_name="resolved_url", namespace=NAMESPACE
         )
         self.notified_height: typing.Optional[int] = None
         # Cache some idea of room to avoid recounting on each subscription
@@ -210,14 +274,21 @@ class SessionManager:
 
         self.running = False
         # hashX: List[int]
-        self.hashX_raw_history_cache = LFUCacheWithMetrics(env.hashX_history_cache_size, metric_name='raw_history', namespace=NAMESPACE)
+        self.hashX_raw_history_cache = LFUCacheWithMetrics(
+            env.hashX_history_cache_size, metric_name="raw_history", namespace=NAMESPACE
+        )
         # hashX: List[CachedAddressHistoryItem]
-        self.hashX_history_cache = LargestValueCache(env.largest_hashX_history_cache_size)
+        self.hashX_history_cache = LargestValueCache(
+            env.largest_hashX_history_cache_size
+        )
         # tx_num: Tuple[txid, height]
-        self.history_tx_info_cache = LFUCacheWithMetrics(env.history_tx_cache_size, metric_name='history_tx', namespace=NAMESPACE)
+        self.history_tx_info_cache = LFUCacheWithMetrics(
+            env.history_tx_cache_size, metric_name="history_tx", namespace=NAMESPACE
+        )
 
     def clear_caches(self):
         self.resolve_cache.clear()
+        self.db.short_url_cache.clear()
 
     def update_history_caches(self, touched_hashXs: typing.List[bytes]):
         update_history_cache = {}
@@ -226,13 +297,15 @@ class SessionManager:
             # if the history is the raw_history_cache, update it
             # TODO: use a reversed iterator for this instead of rescanning it all
             if hashX in self.hashX_raw_history_cache:
-                self.hashX_raw_history_cache[hashX] = history_tx_nums = self.db._read_history(hashX, None)
+                self.hashX_raw_history_cache[hashX] = history_tx_nums = (
+                    self.db._read_history(hashX, None)
+                )
             # if it's in hashX_history_cache, prepare to update it in a batch
             if hashX in self.hashX_history_cache:
                 full_cached = self.hashX_history_cache[hashX]
                 if history_tx_nums is None:
                     history_tx_nums = self.db._read_history(hashX, None)
-                new_txs = history_tx_nums[len(full_cached):]
+                new_txs = history_tx_nums[len(full_cached) :]
                 update_history_cache[hashX] = full_cached, new_txs
         if update_history_cache:
             # get the set of new tx nums that were touched in all of the new histories to be cached
@@ -242,9 +315,15 @@ class SessionManager:
             total_tx_nums = list(total_tx_nums)
             # collect the total new tx infos
             referenced_new_txs = {
-                tx_num: (CachedAddressHistoryItem(
-                    tx_hash=tx_hash[::-1].hex(), height=bisect_right(self.db.tx_counts, tx_num)
-                )) for tx_num, tx_hash in zip(total_tx_nums, self.db._get_tx_hashes(total_tx_nums))
+                tx_num: (
+                    CachedAddressHistoryItem(
+                        tx_hash=tx_hash[::-1].hex(),
+                        height=bisect_right(self.db.tx_counts, tx_num),
+                    )
+                )
+                for tx_num, tx_hash in zip(
+                    total_tx_nums, self.db._get_tx_hashes(total_tx_nums)
+                )
             }
             # update the cached history lists
             get_referenced = referenced_new_txs.__getitem__
@@ -256,7 +335,7 @@ class SessionManager:
     async def _start_server(self, kind, *args, **kw_args):
         loop = asyncio.get_event_loop()
 
-        if kind == 'TCP':
+        if kind == "TCP":
             protocol_class = self.protocol_class
         else:
             raise ValueError(kind)
@@ -264,14 +343,17 @@ class SessionManager:
 
         host, port = args[:2]
         try:
-            self.servers[kind] = await loop.create_server(protocol_factory, *args, **kw_args)
+            self.servers[kind] = await loop.create_server(
+                protocol_factory, *args, **kw_args
+            )
         except Exception as e:
             if not isinstance(e, asyncio.CancelledError):
-                self.logger.error(f'{kind} server failed to listen on '
-                                  f'{host}:{port:d} : {e!r}')
+                self.logger.error(
+                    f"{kind} server failed to listen on {host}:{port:d} : {e!r}"
+                )
             raise
         else:
-            self.logger.info(f'{kind} server listening on {host}:{port:d}')
+            self.logger.info(f"{kind} server listening on {host}:{port:d}")
 
     async def _start_external_servers(self):
         """Start listening on TCP and SSL ports, but only if the respective
@@ -284,7 +366,7 @@ class SessionManager:
         started = False
         while not started:
             try:
-                await self._start_server('TCP', host, env.tcp_port)
+                await self._start_server("TCP", host, env.tcp_port)
                 started = True
             except OSError as e:
                 if e.errno is errno.EADDRINUSE:
@@ -292,12 +374,12 @@ class SessionManager:
                     continue
                 raise
 
-
     async def _close_servers(self, kinds):
         """Close the servers of the given kinds (TCP etc.)."""
         if kinds:
-            self.logger.info('closing down {} listening servers'
-                             .format(', '.join(kinds)))
+            self.logger.info(
+                "closing down {} listening servers".format(", ".join(kinds))
+            )
         for kind in kinds:
             server = self.servers.pop(kind, None)
             if server:
@@ -313,16 +395,18 @@ class SessionManager:
             self.session_event.clear()
             if not paused and len(self.sessions) >= max_sessions:
                 self.on_unavailable_callback()
-                self.logger.info(f'maximum sessions {max_sessions:,d} '
-                                 f'reached, stopping new connections until '
-                                 f'count drops to {low_watermark:,d}')
-                await self._close_servers(['TCP', 'SSL'])
+                self.logger.info(
+                    f"maximum sessions {max_sessions:,d} "
+                    f"reached, stopping new connections until "
+                    f"count drops to {low_watermark:,d}"
+                )
+                await self._close_servers(["TCP", "SSL"])
                 paused = True
             # Start listening for incoming connections if paused and
             # session count has fallen
             if paused and len(self.sessions) <= low_watermark:
                 self.on_available_callback()
-                self.logger.info('resuming listening for incoming connections')
+                self.logger.info("resuming listening for incoming connections")
                 await self._start_external_servers()
                 paused = False
 
@@ -348,7 +432,7 @@ class SessionManager:
 
     async def _for_each_session(self, session_ids, operation):
         if not isinstance(session_ids, list):
-            raise RPCError(BAD_REQUEST, 'expected a list of session IDs')
+            raise RPCError(BAD_REQUEST, "expected a list of session IDs")
 
         result = []
         for session_id in session_ids:
@@ -356,7 +440,7 @@ class SessionManager:
             if session:
                 result.append(await operation(session))
             else:
-                result.append(f'unknown session: {session_id}')
+                result.append(f"unknown session: {session_id}")
         return result
 
     async def _clear_stale_sessions(self):
@@ -365,22 +449,28 @@ class SessionManager:
         while True:
             await sleep(session_timeout // 10)
             stale_cutoff = time.perf_counter() - session_timeout
-            stale_sessions = [session for session in self.sessions.values()
-                              if session.last_recv < stale_cutoff]
+            stale_sessions = [
+                session
+                for session in self.sessions.values()
+                if session.last_recv < stale_cutoff
+            ]
             if stale_sessions:
-                text = ', '.join(str(session.session_id)
-                                 for session in stale_sessions)
-                self.logger.info(f'closing stale connections {text}')
+                text = ", ".join(str(session.session_id) for session in stale_sessions)
+                self.logger.info(f"closing stale connections {text}")
                 # Give the sockets some time to close gracefully
                 if stale_sessions:
-                    await asyncio.wait([
-                        session.close(force_after=session_timeout // 10) for session in stale_sessions
-                    ])
+                    await asyncio.wait(
+                        [
+                            session.close(force_after=session_timeout // 10)
+                            for session in stale_sessions
+                        ]
+                    )
 
             # Consolidate small groups
             group_map = self._group_map()
-            groups = [group for group, sessions in group_map.items()
-                      if len(sessions) <= 5]  # fixme: apply session cost here
+            groups = [
+                group for group, sessions in group_map.items() if len(sessions) <= 5
+            ]  # fixme: apply session cost here
             if len(groups) > 1:
                 new_group = groups[-1]
                 for group in groups:
@@ -409,23 +499,23 @@ class SessionManager:
             for request, _ in s.connection._requests.values():
                 method_counts[request.method] += 1
         return {
-            'closing': closing,
-            'daemon': self.daemon.logged_url(),
-            'daemon_height': self.daemon.cached_height(),
-            'db_height': self.db.db_height,
-            'errors': error_count,
-            'groups': len(group_map),
-            'logged': logged,
-            'paused': paused,
-            'pid': os.getpid(),
-            'peers': [],
-            'requests': pending_requests,
-            'method_counts': method_counts,
-            'sessions': self.session_count(),
-            'subs': self._sub_count(),
-            'txs_sent': self.txs_sent,
-            'uptime': formatted_time(time.time() - self.start_time),
-            'version': __version__,
+            "closing": closing,
+            "daemon": self.daemon.logged_url(),
+            "daemon_height": self.daemon.cached_height(),
+            "db_height": self.db.db_height,
+            "errors": error_count,
+            "groups": len(group_map),
+            "logged": logged,
+            "paused": paused,
+            "pid": os.getpid(),
+            "peers": [],
+            "requests": pending_requests,
+            "method_counts": method_counts,
+            "sessions": self.session_count(),
+            "subs": self._sub_count(),
+            "txs_sent": self.txs_sent,
+            "uptime": formatted_time(time.time() - self.start_time),
+            "version": __version__,
         }
 
     def _group_data(self):
@@ -433,17 +523,20 @@ class SessionManager:
         result = []
         group_map = self._group_map()
         for group, sessions in group_map.items():
-            result.append([group.gid,
-                           len(sessions),
-                           sum(s.bw_charge for s in sessions),
-                           sum(s.count_pending_items() for s in sessions),
-                           sum(s.txs_sent for s in sessions),
-                           sum(s.sub_count() for s in sessions),
-                           sum(s.recv_count for s in sessions),
-                           sum(s.recv_size for s in sessions),
-                           sum(s.send_count for s in sessions),
-                           sum(s.send_size for s in sessions),
-                           ])
+            result.append(
+                [
+                    group.gid,
+                    len(sessions),
+                    sum(s.bw_charge for s in sessions),
+                    sum(s.count_pending_items() for s in sessions),
+                    sum(s.txs_sent for s in sessions),
+                    sum(s.sub_count() for s in sessions),
+                    sum(s.recv_count for s in sessions),
+                    sum(s.recv_size for s in sessions),
+                    sum(s.send_count for s in sessions),
+                    sum(s.send_size for s in sessions),
+                ]
+            )
         return result
 
     async def _electrum_and_raw_headers(self, height):
@@ -458,7 +551,7 @@ class SessionManager:
         # Paranoia: a reorg could race and leave db_height lower
         height = min(height, self.db.db_height)
         electrum, raw = await self._electrum_and_raw_headers(height)
-        self.hsub_results = (electrum, {'hex': raw.hex(), 'height': height})
+        self.hsub_results = (electrum, {"hex": raw.hex(), "height": height})
         self.notified_height = height
 
     # --- LocalRPC command handlers
@@ -588,12 +681,13 @@ class SessionManager:
         """Start the RPC server if enabled.  When the event is triggered,
         start TCP and SSL servers."""
         try:
-            self.logger.info(f'max session count: {self.env.max_sessions:,d}')
-            self.logger.info(f'session timeout: '
-                             f'{self.env.session_timeout:,d} seconds')
-            self.logger.info(f'max response size {self.env.max_send:,d} bytes')
+            self.logger.info(f"max session count: {self.env.max_sessions:,d}")
+            self.logger.info(f"session timeout: {self.env.session_timeout:,d} seconds")
+            self.logger.info(f"max response size {self.env.max_send:,d} bytes")
             if self.env.drop_client is not None:
-                self.logger.info(f'drop clients matching: {self.env.drop_client.pattern}')
+                self.logger.info(
+                    f"drop clients matching: {self.env.drop_client.pattern}"
+                )
             # Start notifications; initialize hsub_results
             await mempool.start(self.db.db_height, self)
             await self.start_other()
@@ -602,10 +696,7 @@ class SessionManager:
             self.on_available_callback()
             # Peer discovery should start after the external servers
             # because we connect to ourself
-            await asyncio.wait([
-                self._clear_stale_sessions(),
-                self._manage_servers()
-            ])
+            await asyncio.wait([self._clear_stale_sessions(), self._manage_servers()])
         except Exception as err:
             if not isinstance(err, asyncio.CancelledError):
                 log.exception("hub server died")
@@ -614,9 +705,9 @@ class SessionManager:
             await self._close_servers(list(self.servers.keys()))
             log.info("disconnect %i sessions", len(self.sessions))
             if self.sessions:
-                await asyncio.wait([
-                    session.close(force_after=1) for session in self.sessions.values()
-                ])
+                await asyncio.wait(
+                    [session.close(force_after=1) for session in self.sessions.values()]
+                )
             await self.stop_other()
 
     async def start_other(self):
@@ -634,15 +725,14 @@ class SessionManager:
         try:
             return await getattr(self.daemon, method)(*args)
         except DaemonError as e:
-            raise RPCError(DAEMON_ERROR, f'daemon error: {e!r}') from None
+            raise RPCError(DAEMON_ERROR, f"daemon error: {e!r}") from None
 
     async def raw_header(self, height):
         """Return the binary header at the given height."""
         try:
             return await self.db.raw_header(height)
         except IndexError:
-            raise RPCError(BAD_REQUEST, f'height {height:,d} '
-                                        'out of range') from None
+            raise RPCError(BAD_REQUEST, f"height {height:,d} out of range") from None
 
     async def electrum_header(self, height):
         """Return the deserialized header at the given height."""
@@ -654,14 +744,19 @@ class SessionManager:
         self.txs_sent += 1
         return hex_hash
 
-    async def _cached_raw_history(self, hashX: bytes, limit: typing.Optional[int] = None):
+    async def _cached_raw_history(
+        self, hashX: bytes, limit: typing.Optional[int] = None
+    ):
         tx_nums = self.hashX_raw_history_cache.get(hashX)
         if tx_nums is None:
-            self.hashX_raw_history_cache[hashX] = tx_nums = await self.db.read_history(hashX, limit)
+            self.hashX_raw_history_cache[hashX] = tx_nums = await self.db.read_history(
+                hashX, limit
+            )
         return tx_nums
 
-    async def cached_confirmed_history(self, hashX: bytes,
-                                       limit: typing.Optional[int] = None) -> typing.List[CachedAddressHistoryItem]:
+    async def cached_confirmed_history(
+        self, hashX: bytes, limit: typing.Optional[int] = None
+    ) -> typing.List[CachedAddressHistoryItem]:
         cached_full_history = self.hashX_history_cache.get(hashX)
         # return the cached history
         if cached_full_history is not None:
@@ -672,7 +767,9 @@ class SessionManager:
         needed_tx_infos = []
         append_needed_tx_info = needed_tx_infos.append
         tx_infos = {}
-        for cnt, tx_num in enumerate(tx_nums):  # determine which tx_hashes are cached and which we need to look up
+        for cnt, tx_num in enumerate(
+            tx_nums
+        ):  # determine which tx_hashes are cached and which we need to look up
             cached = self.history_tx_info_cache.get(tx_num)
             if cached is not None:
                 tx_infos[tx_num] = cached
@@ -680,9 +777,16 @@ class SessionManager:
                 append_needed_tx_info(tx_num)
             if cnt % 1000 == 0:
                 await asyncio.sleep(0)
-        if needed_tx_infos:  # request all the needed tx hashes in one batch, cache the txids and heights
-            for cnt, (tx_num, tx_hash) in enumerate(zip(needed_tx_infos, await self.db.get_tx_hashes(needed_tx_infos))):
-                hist = CachedAddressHistoryItem(tx_hash=tx_hash[::-1].hex(), height=bisect_right(self.db.tx_counts, tx_num))
+        if (
+            needed_tx_infos
+        ):  # request all the needed tx hashes in one batch, cache the txids and heights
+            for cnt, (tx_num, tx_hash) in enumerate(
+                zip(needed_tx_infos, await self.db.get_tx_hashes(needed_tx_infos))
+            ):
+                hist = CachedAddressHistoryItem(
+                    tx_hash=tx_hash[::-1].hex(),
+                    height=bisect_right(self.db.tx_counts, tx_num),
+                )
                 tx_infos[tx_num] = self.history_tx_info_cache[tx_num] = hist
                 if cnt % 1000 == 0:
                     await asyncio.sleep(0)
@@ -702,9 +806,9 @@ class SessionManager:
         for session in self.sessions.values():
             if session.subscribe_peers:
                 notify_count += 1
-                session.send_notification('blockchain.peers.subscribe', [peer])
+                session.send_notification("blockchain.peers.subscribe", [peer])
         if notify_count:
-            self.logger.info(f'notify {notify_count} sessions of new peers')
+            self.logger.info(f"notify {notify_count} sessions of new peers")
 
     def add_session(self, session):
         self.sessions[id(session)] = session
@@ -738,17 +842,30 @@ class LBRYElectrumX(asyncio.Protocol):
 
     MAX_CHUNK_SIZE = 40960
     session_counter = itertools.count()
-    RESPONSE_TIMES = Histogram("response_time", "Response times", namespace=NAMESPACE,
-                               labelnames=("method",), buckets=HISTOGRAM_BUCKETS)
-    NOTIFICATION_COUNT = Counter("notification", "Number of notifications sent (for subscriptions)",
-                                 namespace=NAMESPACE, labelnames=("method",))
+    RESPONSE_TIMES = Histogram(
+        "response_time",
+        "Response times",
+        namespace=NAMESPACE,
+        labelnames=("method",),
+        buckets=HISTOGRAM_BUCKETS,
+    )
+    NOTIFICATION_COUNT = Counter(
+        "notification",
+        "Number of notifications sent (for subscriptions)",
+        namespace=NAMESPACE,
+        labelnames=("method",),
+    )
     REQUEST_ERRORS_COUNT = Counter(
-        "request_error", "Number of requests that returned errors", namespace=NAMESPACE,
-        labelnames=("method", "version")
+        "request_error",
+        "Number of requests that returned errors",
+        namespace=NAMESPACE,
+        labelnames=("method", "version"),
     )
     RESET_CONNECTIONS = Counter(
-        "reset_clients", "Number of reset connections by client version",
-        namespace=NAMESPACE, labelnames=("version",)
+        "reset_clients",
+        "Number of reset connections by client version",
+        namespace=NAMESPACE,
+        labelnames=("version",),
     )
     max_errors = 10
 
@@ -782,7 +899,7 @@ class LBRYElectrumX(asyncio.Protocol):
         self.last_recv = self.start_time
         self.last_packet_received = self.start_time
         self.connection = connection or self.default_connection()
-        self.client_version = 'unknown'
+        self.client_version = "unknown"
 
         self.logger = logging.getLogger(__name__)
         self.session_manager = session_manager
@@ -812,7 +929,7 @@ class LBRYElectrumX(asyncio.Protocol):
         """Called by asyncio when a message comes in."""
         self.last_packet_received = time.perf_counter()
         if self.verbosity >= 4:
-            self.logger.debug(f'Received framed message {framed_message}')
+            self.logger.debug(f"Received framed message {framed_message}")
         self.recv_size += len(framed_message)
         self.framer.received_bytes(framed_message)
 
@@ -833,7 +950,7 @@ class LBRYElectrumX(asyncio.Protocol):
         self.transport = transport
         # This would throw if called on a closed SSL transport.  Fixed
         # in asyncio in Python 3.6.1 and 3.5.4
-        peer_address = transport.get_extra_info('peername')
+        peer_address = transport.get_extra_info("peername")
         # If the Socks proxy was used then _address is already set to
         # the remote address
         if self._address:
@@ -846,7 +963,9 @@ class LBRYElectrumX(asyncio.Protocol):
         # context = {'conn_id': f'{self.session_id}'}
         # self.logger = logging.getLogger(__name__)  # util.ConnectionLogger(self.logger, context)
         self.group = self.session_manager.add_session(self)
-        self.session_manager.session_count_metric.labels(version=self.client_version).inc()
+        self.session_manager.session_count_metric.labels(
+            version=self.client_version
+        ).inc()
         # self.logger.info(f'{self.kind} {self.peer_address_str()}, {self.session_manager.session_count():,d} total')
 
     def connection_lost(self, exc):
@@ -861,15 +980,18 @@ class LBRYElectrumX(asyncio.Protocol):
         self._can_send.set()
 
         self.session_manager.remove_session(self)
-        self.session_manager.session_count_metric.labels(version=self.client_version).dec()
-        msg = ''
+        self.session_manager.session_count_metric.labels(
+            version=self.client_version
+        ).dec()
+        msg = ""
         if not self._can_send.is_set():
-            msg += ' whilst paused'
+            msg += " whilst paused"
         if self.send_size >= 1024 * 1024:
-            msg += ('.  Sent {:,d} bytes in {:,d} messages'
-                    .format(self.send_size, self.send_count))
+            msg += ".  Sent {:,d} bytes in {:,d} messages".format(
+                self.send_size, self.send_count
+            )
         if msg:
-            msg = 'disconnected' + msg
+            msg = "disconnected" + msg
             self.logger.info(msg)
 
     def default_framer(self):
@@ -890,77 +1012,77 @@ class LBRYElectrumX(asyncio.Protocol):
         """
         if isinstance(request, Request):
             method = request.method
-            if method == 'blockchain.block.get_chunk':
+            if method == "blockchain.block.get_chunk":
                 coro = self.block_get_chunk
-            elif method == 'blockchain.block.get_header':
+            elif method == "blockchain.block.get_header":
                 coro = self.block_get_header
-            elif method == 'blockchain.block.get_server_height':
+            elif method == "blockchain.block.get_server_height":
                 coro = self.get_server_height
-            elif method == 'blockchain.scripthash.get_history':
+            elif method == "blockchain.scripthash.get_history":
                 coro = self.scripthash_get_history
-            elif method == 'blockchain.scripthash.get_mempool':
+            elif method == "blockchain.scripthash.get_mempool":
                 coro = self.scripthash_get_mempool
-            elif method == 'blockchain.scripthash.subscribe':
+            elif method == "blockchain.scripthash.subscribe":
                 coro = self.scripthash_subscribe
-            elif method == 'blockchain.scripthash.unsubscribe':
+            elif method == "blockchain.scripthash.unsubscribe":
                 coro = self.scripthash_unsubscribe
-            elif method == 'blockchain.scripthash.get_balance':
+            elif method == "blockchain.scripthash.get_balance":
                 coro = self.scripthash_get_balance
-            elif method == 'blockchain.scripthash.listunspent':
+            elif method == "blockchain.scripthash.listunspent":
                 coro = self.scripthash_listunspent
-            elif method == 'blockchain.transaction.broadcast':
+            elif method == "blockchain.transaction.broadcast":
                 coro = self.transaction_broadcast
-            elif method == 'blockchain.transaction.get':
+            elif method == "blockchain.transaction.get":
                 coro = self.transaction_get
-            elif method == 'blockchain.transaction.get_batch':
+            elif method == "blockchain.transaction.get_batch":
                 coro = self.transaction_get_batch
-            elif method == 'blockchain.transaction.info':
+            elif method == "blockchain.transaction.info":
                 coro = self.transaction_info
-            elif method == 'blockchain.transaction.get_merkle':
+            elif method == "blockchain.transaction.get_merkle":
                 coro = self.transaction_merkle
-            elif method == 'blockchain.transaction.get_height':
+            elif method == "blockchain.transaction.get_height":
                 coro = self.transaction_get_height
-            elif method == 'blockchain.block.headers':
+            elif method == "blockchain.block.headers":
                 coro = self.block_headers
-            elif method == 'server.banner':
+            elif method == "server.banner":
                 coro = self.banner
-            elif method == 'server.payment_address':
+            elif method == "server.payment_address":
                 coro = self.payment_address
-            elif method == 'server.donation_address':
+            elif method == "server.donation_address":
                 coro = self.donation_address
-            elif method == 'server.features':
+            elif method == "server.features":
                 coro = self.server_features_async
-            elif method == 'server.peers.subscribe':
+            elif method == "server.peers.subscribe":
                 coro = self.peers_subscribe
-            elif method == 'server.version':
+            elif method == "server.version":
                 coro = self.server_version
-            elif method == 'blockchain.claimtrie.search':
+            elif method == "blockchain.claimtrie.search":
                 coro = self.claimtrie_search
-            elif method == 'blockchain.claimtrie.resolve':
+            elif method == "blockchain.claimtrie.resolve":
                 coro = self.claimtrie_resolve
-            elif method == 'blockchain.claimtrie.getclaimbyid':
+            elif method == "blockchain.claimtrie.getclaimbyid":
                 coro = self.claimtrie_getclaimbyid
-            elif method == 'mempool.get_fee_histogram':
+            elif method == "mempool.get_fee_histogram":
                 coro = self.mempool_compact_histogram
-            elif method == 'server.ping':
+            elif method == "server.ping":
                 coro = self.ping
-            elif method == 'blockchain.headers.subscribe':
+            elif method == "blockchain.headers.subscribe":
                 coro = self.headers_subscribe_False
-            elif method == 'blockchain.address.get_history':
+            elif method == "blockchain.address.get_history":
                 coro = self.address_get_history
-            elif method == 'blockchain.address.get_mempool':
+            elif method == "blockchain.address.get_mempool":
                 coro = self.address_get_mempool
-            elif method == 'blockchain.address.subscribe':
+            elif method == "blockchain.address.subscribe":
                 coro = self.address_subscribe
-            elif method == 'blockchain.address.unsubscribe':
+            elif method == "blockchain.address.unsubscribe":
                 coro = self.address_unsubscribe
-            elif method == 'blockchain.address.listunspent':
+            elif method == "blockchain.address.listunspent":
                 coro = self.address_listunspent
-            elif method == 'blockchain.address.getbalance':
+            elif method == "blockchain.address.getbalance":
                 coro = self.address_get_balance
-            elif method == 'blockchain.estimatefee':
+            elif method == "blockchain.estimatefee":
                 coro = self.estimatefee
-            elif method == 'blockchain.relayfee':
+            elif method == "blockchain.relayfee":
                 coro = self.relayfee
             else:
                 raise RPCError(JSONRPC.METHOD_NOT_FOUND, f'unknown method "{method}"')
@@ -976,7 +1098,7 @@ class LBRYElectrumX(asyncio.Protocol):
             await asyncio.wait_for(self._can_send.wait(), secs)
         except asyncio.TimeoutError:
             self.abort()
-            raise asyncio.TimeoutError(f'task timed out after {secs}s')
+            raise asyncio.TimeoutError(f"task timed out after {secs}s")
 
     async def _send_message(self, message):
         if not self._can_send.is_set():
@@ -987,7 +1109,7 @@ class LBRYElectrumX(asyncio.Protocol):
             self.send_count += 1
             self.last_send = time.perf_counter()
             if self.verbosity >= 4:
-                self.logger.debug(f'Sending framed message {framed_message}')
+                self.logger.debug(f"Sending framed message {framed_message}")
             self.transport.write(framed_message)
 
     def _bump_errors(self):
@@ -1038,8 +1160,11 @@ class LBRYElectrumX(asyncio.Protocol):
             try:
                 message = await self.framer.receive_message()
             except MemoryError:
-                self.logger.warning('received oversized message from %s:%s, dropping connection',
-                                    self._address[0], self._address[1])
+                self.logger.warning(
+                    "received oversized message from %s:%s, dropping connection",
+                    self._address[0],
+                    self._address[1],
+                )
                 self.RESET_CONNECTIONS.labels(version=self.client_version).inc()
                 self._close()
                 return
@@ -1050,7 +1175,7 @@ class LBRYElectrumX(asyncio.Protocol):
             try:
                 requests = self.connection.receive_message(message)
             except ProtocolError as e:
-                self.logger.debug(f'{e}')
+                self.logger.debug(f"{e}")
                 if e.error_message:
                     await self._send_message(e.error_message)
                 if e.code == JSONRPC.PARSE_ERROR:
@@ -1070,19 +1195,19 @@ class LBRYElectrumX(asyncio.Protocol):
             raise
         except Exception:
             reqstr = str(request)
-            self.logger.exception(f'exception handling {reqstr[:16_000]}')
-            result = RPCError(JSONRPC.INTERNAL_ERROR,
-                              'internal server error')
+            self.logger.exception(f"exception handling {reqstr[:16_000]}")
+            result = RPCError(JSONRPC.INTERNAL_ERROR, "internal server error")
         if isinstance(request, Request):
             message = request.send_result(result)
-            self.RESPONSE_TIMES.labels(method=request.method).observe(time.perf_counter() - start)
+            self.RESPONSE_TIMES.labels(method=request.method).observe(
+                time.perf_counter() - start
+            )
             if message:
                 await self._send_message(message)
         if isinstance(result, Exception):
             self._bump_errors()
             self.REQUEST_ERRORS_COUNT.labels(
-                method=request.method,
-                version=self.client_version
+                method=request.method, version=self.client_version
             ).inc()
 
     # External API
@@ -1093,7 +1218,9 @@ class LBRYElectrumX(asyncio.Protocol):
     async def send_request(self, method, args=()):
         """Send an RPC request over the network."""
         if self.is_closing():
-            raise asyncio.TimeoutError("Trying to send request on a recently dropped connection.")
+            raise asyncio.TimeoutError(
+                "Trying to send request on a recently dropped connection."
+            )
         message, event = self.connection.send_request(Request(method, args))
         await self._send_message(message)
         await event.wait()
@@ -1110,7 +1237,9 @@ class LBRYElectrumX(asyncio.Protocol):
             await self._send_message(message)
             return True
         except asyncio.TimeoutError:
-            self.logger.info(f"timeout sending address notification to {self._address[0]}:{self._address[1]}")
+            self.logger.info(
+                f"timeout sending address notification to {self._address[0]}:{self._address[1]}"
+            )
             self.abort()
             return False
 
@@ -1124,7 +1253,9 @@ class LBRYElectrumX(asyncio.Protocol):
             await self._send_message(message)
             return True
         except asyncio.TimeoutError:
-            self.logger.info(f"timeout sending address notification to {self._address[0]}:{self._address[1]}")
+            self.logger.info(
+                f"timeout sending address notification to {self._address[0]}:{self._address[1]}"
+            )
             self.abort()
             return False
 
@@ -1146,27 +1277,28 @@ class LBRYElectrumX(asyncio.Protocol):
 
     @classmethod
     def protocol_min_max_strings(cls):
-        return [version_string(ver)
-                for ver in (cls.PROTOCOL_MIN, cls.PROTOCOL_MAX)]
+        return [version_string(ver) for ver in (cls.PROTOCOL_MIN, cls.PROTOCOL_MAX)]
 
     @classmethod
     def set_server_features(cls, env):
         """Return the server features dictionary."""
         min_str, max_str = cls.protocol_min_max_strings()
-        cls.cached_server_features.update({
-            'hosts': {},
-            'pruning': None,
-            'server_version': cls.version,
-            'protocol_min': min_str,
-            'protocol_max': max_str,
-            'genesis_hash': env.coin.GENESIS_HASH,
-            'description': env.description,
-            'payment_address': env.payment_address,
-            'donation_address': env.donation_address,
-            'daily_fee': env.daily_fee,
-            'hash_function': 'sha256',
-            'trending_algorithm': 'fast_ar'
-        })
+        cls.cached_server_features.update(
+            {
+                "hosts": {},
+                "pruning": None,
+                "server_version": cls.version,
+                "protocol_min": min_str,
+                "protocol_max": max_str,
+                "genesis_hash": env.coin.GENESIS_HASH,
+                "description": env.description,
+                "payment_address": env.payment_address,
+                "donation_address": env.donation_address,
+                "daily_fee": env.daily_fee,
+                "hash_function": "sha256",
+                "trending_algorithm": "fast_ar",
+            }
+        )
 
     async def server_features_async(self):
         return self.cached_server_features
@@ -1184,8 +1316,9 @@ class LBRYElectrumX(asyncio.Protocol):
 
     async def get_hashX_status(self, hashX: bytes):
         if self.env.index_address_status:
-            return await self.db.get_hashX_status(hashX)
-        history = ''.join(
+            mempool_history = self.mempool.mempool_history(hashX)
+            return await self.db.get_hashX_status(hashX, mempool_history or None)
+        history = "".join(
             f"{tx_hash[::-1].hex()}:{height:d}:"
             for tx_hash, height in await self.db.limited_history(hashX, limit=None)
         ) + self.mempool.mempool_history(hashX)
@@ -1196,7 +1329,19 @@ class LBRYElectrumX(asyncio.Protocol):
 
     async def get_hashX_statuses(self, hashXes: typing.List[bytes]):
         if self.env.index_address_status:
-            return await self.db.get_hashX_statuses(hashXes)
+            mempool_histories = None
+            if self.mempool.touched_hashXs:
+                mempool_histories = {
+                    hashX: self.mempool.mempool_history(hashX)
+                    for hashX in hashXes
+                    if hashX in self.mempool.touched_hashXs
+                }
+                mempool_histories = {
+                    hashX: history
+                    for hashX, history in mempool_histories.items()
+                    if history
+                }
+            return await self.db.get_hashX_statuses(hashXes, mempool_histories or None)
         return [await self.get_hashX_status(hashX) for hashX in hashXes]
 
     async def _send_history_notifications(self, hashXes: typing.List[bytes]):
@@ -1211,20 +1356,26 @@ class LBRYElectrumX(asyncio.Protocol):
         for hashX, status in zip(hashXes, statuses):
             alias = self.hashX_subs[hashX]
             if len(alias) == 64:
-                method = 'blockchain.scripthash.subscribe'
+                method = "blockchain.scripthash.subscribe"
                 scripthash_notifications += 1
             else:
-                method = 'blockchain.address.subscribe'
+                method = "blockchain.address.subscribe"
                 address_notifications += 1
             notifications.append(Notification(method, (alias, status)))
         if scripthash_notifications:
-            self.NOTIFICATION_COUNT.labels(method='blockchain.scripthash.subscribe',).inc(scripthash_notifications)
+            self.NOTIFICATION_COUNT.labels(
+                method="blockchain.scripthash.subscribe",
+            ).inc(scripthash_notifications)
         if address_notifications:
-            self.NOTIFICATION_COUNT.labels(method='blockchain.address.subscribe', ).inc(address_notifications)
+            self.NOTIFICATION_COUNT.labels(
+                method="blockchain.address.subscribe",
+            ).inc(address_notifications)
         self.session_manager.notifications_in_flight_metric.inc(len(notifications))
         try:
             await self._send_notifications(Batch(notifications))
-            self.session_manager.notifications_sent_metric.observe(time.perf_counter() - start)
+            self.session_manager.notifications_sent_metric.observe(
+                time.perf_counter() - start
+            )
         finally:
             self.session_manager.notifications_in_flight_metric.dec(len(notifications))
 
@@ -1241,7 +1392,6 @@ class LBRYElectrumX(asyncio.Protocol):
     #     else:
     #         return APICallMetrics(query_name)
 
-
     # async def run_and_cache_query(self, query_name, kwargs):
     #     start = time.perf_counter()
     #     if isinstance(kwargs, dict):
@@ -1257,40 +1407,55 @@ class LBRYElectrumX(asyncio.Protocol):
     #         self.session_manager.executor_time_metric.observe(time.perf_counter() - start)
 
     async def mempool_compact_histogram(self):  # TODO: fix this
-        return [] #self.mempool.compact_fee_histogram()
+        return []  # self.mempool.compact_fee_histogram()
 
     async def claimtrie_search(self, **kwargs):
         start = time.perf_counter()
-        if 'release_time' in kwargs:
-            release_time = kwargs.pop('release_time')
-            release_times = release_time if isinstance(release_time, list) else [release_time]
+        if "release_time" in kwargs:
+            release_time = kwargs.pop("release_time")
+            release_times = (
+                release_time if isinstance(release_time, list) else [release_time]
+            )
             try:
-                kwargs['release_time'] = [format_release_time(release_time) for release_time in release_times]
+                kwargs["release_time"] = [
+                    format_release_time(release_time) for release_time in release_times
+                ]
             except ValueError as e:
                 # Log invalid release_time and return error to client
-                self.logger.warning("Invalid release_time parameter from %s: %s",
-                                   self.peer_address()[0] if self.peer_address() else 'unknown', str(e))
-                raise RPCError(BAD_REQUEST, f'invalid release_time parameter: {str(e)}')
+                self.logger.warning(
+                    "Invalid release_time parameter from %s: %s",
+                    self.peer_address()[0] if self.peer_address() else "unknown",
+                    str(e),
+                )
+                raise RPCError(BAD_REQUEST, f"invalid release_time parameter: {str(e)}")
         try:
             self.session_manager.pending_query_metric.inc()
-            if 'channel' in kwargs:
-                channel_url = kwargs.pop('channel')
+            if "channel" in kwargs:
+                channel_url = kwargs.pop("channel")
                 _, channel_claim, _, _ = await self.db.resolve(channel_url)
-                if not channel_claim or isinstance(channel_claim, (ResolveCensoredError, LookupError, ValueError)):
+                if not channel_claim or isinstance(
+                    channel_claim, (ResolveCensoredError, LookupError, ValueError)
+                ):
                     return Outputs.to_base64([], [])
-                kwargs['channel_id'] = channel_claim.claim_hash.hex()
+                kwargs["channel_id"] = channel_claim.claim_hash.hex()
             return await self.session_manager.search_index.cached_search(kwargs)
         except ConnectionTimeout:
             self.session_manager.search_index.timeout_counter.inc()
-            raise RPCError(JSONRPC.QUERY_TIMEOUT, 'query timed out')
+            raise RPCError(JSONRPC.QUERY_TIMEOUT, "query timed out")
         except TooManyClaimSearchParametersError as err:
             await asyncio.sleep(2)
-            self.logger.warning("Got an invalid query from %s, for %s with more than %d elements.",
-                                self.peer_address()[0], err.key, err.limit)
+            self.logger.warning(
+                "Got an invalid query from %s, for %s with more than %d elements.",
+                self.peer_address()[0],
+                err.key,
+                err.limit,
+            )
             return RPCError(1, str(err))
         finally:
             self.session_manager.pending_query_metric.dec()
-            self.session_manager.executor_time_metric.observe(time.perf_counter() - start)
+            self.session_manager.executor_time_metric.observe(
+                time.perf_counter() - start
+            )
 
     async def claimtrie_resolve(self, *urls) -> str:
         self.session_manager.urls_to_resolve_count_metric.inc(len(urls))
@@ -1355,7 +1520,9 @@ class LBRYElectrumX(asyncio.Protocol):
                 return bisect_right(self.db.tx_counts, v.tx_num)
             return self.mempool.get_mempool_height(tx_hash)
 
-        return await asyncio.get_event_loop().run_in_executor(self.db._executor, get_height)
+        return await asyncio.get_event_loop().run_in_executor(
+            self.db._executor, get_height
+        )
 
     def _getclaimbyid(self, claim_id: str):
         rows = []
@@ -1365,7 +1532,10 @@ class LBRYElectrumX(asyncio.Protocol):
         rows.append(stream or LookupError(f"Could not find claim at {claim_id}"))
         if stream and stream.channel_hash:
             channel = self.db._fs_get_claim_by_hash(stream.channel_hash)
-            extra.append(channel or LookupError(f"Could not find channel at {stream.channel_hash.hex()}"))
+            extra.append(
+                channel
+                or LookupError(f"Could not find channel at {stream.channel_hash.hex()}")
+            )
         if stream and stream.reposted_claim_hash:
             repost = self.db._fs_get_claim_by_hash(stream.reposted_claim_hash)
             if repost:
@@ -1377,14 +1547,14 @@ class LBRYElectrumX(asyncio.Protocol):
         return await self.loop.run_in_executor(None, self._getclaimbyid, claim_id)
 
     def assert_tx_hash(self, value):
-        '''Raise an RPCError if the value is not a valid transaction
-        hash.'''
+        """Raise an RPCError if the value is not a valid transaction
+        hash."""
         try:
             if len(bytes.fromhex(value)) == 32:
                 return
         except Exception:
             pass
-        raise RPCError(1, f'{value} should be a transaction hash')
+        raise RPCError(1, f"{value} should be a transaction hash")
 
     async def subscribe_headers_result(self):
         """The result of a header subscription or notification."""
@@ -1435,11 +1605,16 @@ class LBRYElectrumX(asyncio.Protocol):
         utxos.extend(self.mempool.unordered_UTXOs(hashX))
         spends = self.mempool.potential_spends(hashX)
 
-        return [{'tx_hash': hash_to_hex_str(utxo.tx_hash),
-                 'tx_pos': utxo.tx_pos,
-                 'height': utxo.height, 'value': utxo.value}
-                for utxo in utxos
-                if (utxo.tx_hash, utxo.tx_pos) not in spends]
+        return [
+            {
+                "tx_hash": hash_to_hex_str(utxo.tx_hash),
+                "tx_pos": utxo.tx_pos,
+                "height": utxo.height,
+                "value": utxo.value,
+            }
+            for utxo in utxos
+            if (utxo.tx_hash, utxo.tx_pos) not in spends
+        ]
 
     async def address_listunspent(self, address: str):
         return await self.hashX_listunspent(self.address_to_hashX(address))
@@ -1465,7 +1640,7 @@ class LBRYElectrumX(asyncio.Protocol):
             return self.coin.address_to_hashX(address)
         except Exception:
             pass
-        raise RPCError(BAD_REQUEST, f'{address} is not a valid address')
+        raise RPCError(BAD_REQUEST, f"{address} is not a valid address")
 
     async def address_get_balance(self, address):
         """Return the confirmed and unconfirmed balance of an address."""
@@ -1492,8 +1667,16 @@ class LBRYElectrumX(asyncio.Protocol):
 
         address: the address to subscribe to"""
         if len(addresses) > 1000:
-            raise RPCError(BAD_REQUEST, f'too many addresses in subscription request: {len(addresses)}')
-        hashXes = [item async for item in asyncify_for_loop((self.address_to_hashX(address) for address in addresses), 100)]
+            raise RPCError(
+                BAD_REQUEST,
+                f"too many addresses in subscription request: {len(addresses)}",
+            )
+        hashXes = [
+            item
+            async for item in asyncify_for_loop(
+                (self.address_to_hashX(address) for address in addresses), 100
+            )
+        ]
         for hashX, alias in zip(hashXes, addresses):
             self.hashX_subs[hashX] = alias
             self.session_manager.hashx_subscriptions_by_session[hashX].add(id(self))
@@ -1511,7 +1694,7 @@ class LBRYElectrumX(asyncio.Protocol):
         utxos = await self.db.all_utxos(hashX)
         confirmed = sum(utxo.value for utxo in utxos)
         unconfirmed = self.mempool.balance_delta(hashX)
-        return {'confirmed': confirmed, 'unconfirmed': unconfirmed}
+        return {"confirmed": confirmed, "unconfirmed": unconfirmed}
 
     async def scripthash_get_balance(self, scripthash):
         """Return the confirmed and unconfirmed balance of a scripthash."""
@@ -1521,10 +1704,14 @@ class LBRYElectrumX(asyncio.Protocol):
     def unconfirmed_history(self, hashX):
         # Note unconfirmed history is unordered in electrum-server
         # height is -1 if it has unconfirmed inputs, otherwise 0
-        return [{'tx_hash': hash_to_hex_str(tx.hash),
-                 'height': -tx.has_unconfirmed_inputs,
-                 'fee': tx.fee}
-                for tx in self.mempool.transaction_summaries(hashX)]
+        return [
+            {
+                "tx_hash": hash_to_hex_str(tx.hash),
+                "height": -tx.has_unconfirmed_inputs,
+                "fee": tx.fee,
+            }
+            for tx in self.mempool.transaction_summaries(hashX)
+        ]
 
     async def confirmed_and_unconfirmed_history(self, hashX):
         # Note history is ordered but unconfirmed is unordered in e-s
@@ -1561,14 +1748,16 @@ class LBRYElectrumX(asyncio.Protocol):
     async def _merkle_proof(self, cp_height, height):
         max_height = self.db.db_height
         if not height <= cp_height <= max_height:
-            raise RPCError(BAD_REQUEST,
-                           f'require header height {height:,d} <= '
-                           f'cp_height {cp_height:,d} <= '
-                           f'chain height {max_height:,d}')
+            raise RPCError(
+                BAD_REQUEST,
+                f"require header height {height:,d} <= "
+                f"cp_height {cp_height:,d} <= "
+                f"chain height {max_height:,d}",
+            )
         branch, root = await self.db.header_branch_and_root(cp_height + 1, height)
         return {
-            'branch': [hash_to_hex_str(elt) for elt in branch],
-            'root': hash_to_hex_str(root),
+            "branch": [hash_to_hex_str(elt) for elt in branch],
+            "root": hash_to_hex_str(root),
         }
 
     async def block_headers(self, start_height, count, cp_height=0, b64=False):
@@ -1590,11 +1779,7 @@ class LBRYElectrumX(asyncio.Protocol):
             headers = self.db.encode_headers(start_height, count, headers)
         else:
             headers = headers.hex()
-        result = {
-            'base64' if b64 else 'hex': headers,
-            'count': count,
-            'max': max_size
-        }
+        result = {"base64" if b64 else "hex": headers, "count": count, "max": max_size}
         if count and cp_height:
             last_height = start_height + count - 1
             result.update(await self._merkle_proof(cp_height, last_height))
@@ -1627,18 +1812,18 @@ class LBRYElectrumX(asyncio.Protocol):
     #     return peer_address and peer_address[0] == peername[0]
 
     async def replaced_banner(self, banner):
-        network_info = await self.daemon_request('getnetworkinfo')
-        ni_version = network_info['version']
+        network_info = await self.daemon_request("getnetworkinfo")
+        ni_version = network_info["version"]
         major, minor = divmod(ni_version, 1000000)
         minor, revision = divmod(minor, 10000)
         revision //= 100
-        daemon_version = f'{major:d}.{minor:d}.{revision:d}'
+        daemon_version = f"{major:d}.{minor:d}.{revision:d}"
         for pair in [
-            ('$SERVER_VERSION', self.version),
-            ('$DAEMON_VERSION', daemon_version),
-            ('$DAEMON_SUBVERSION', network_info['subversion']),
-            ('$PAYMENT_ADDRESS', self.env.payment_address),
-            ('$DONATION_ADDRESS', self.env.donation_address),
+            ("$SERVER_VERSION", self.version),
+            ("$DAEMON_VERSION", daemon_version),
+            ("$DAEMON_SUBVERSION", network_info["subversion"]),
+            ("$PAYMENT_ADDRESS", self.env.payment_address),
+            ("$DONATION_ADDRESS", self.env.donation_address),
         ]:
             banner = banner.replace(*pair)
         return banner
@@ -1653,14 +1838,14 @@ class LBRYElectrumX(asyncio.Protocol):
 
     async def banner(self):
         """Return the server banner text."""
-        banner = f'You are connected to an {self.version} server.'
+        banner = f"You are connected to an {self.version} server."
         banner_file = self.env.banner_file
         if banner_file:
             try:
-                with codecs.open(banner_file, 'r', 'utf-8') as f:
+                with codecs.open(banner_file, "r", "utf-8") as f:
                     banner = f.read()
             except Exception as e:
-                self.logger.error(f'reading banner file {banner_file}: {e!r}')
+                self.logger.error(f"reading banner file {banner_file}: {e!r}")
             else:
                 banner = await self.replaced_banner(banner)
 
@@ -1688,7 +1873,7 @@ class LBRYElectrumX(asyncio.Protocol):
         """
         return None
 
-    async def server_version(self, client_name='', client_version=None):
+    async def server_version(self, client_name="", client_version=None):
         """Returns the server version as a string.
 
         client_name: a string identifying the client
@@ -1697,29 +1882,40 @@ class LBRYElectrumX(asyncio.Protocol):
         if self.protocol_string is not None:
             return self.version, self.protocol_string
         if self.sv_seen and self.protocol_tuple >= (1, 4):
-            raise RPCError(BAD_REQUEST, f'server.version already sent')
+            raise RPCError(BAD_REQUEST, f"server.version already sent")
         self.sv_seen = True
 
         if client_name:
             client_name = str(client_name)
-            if self.env.drop_client is not None and \
-                    self.env.drop_client.match(client_name):
+            if self.env.drop_client is not None and self.env.drop_client.match(
+                client_name
+            ):
                 self.close_after_send = True
-                raise RPCError(BAD_REQUEST, f'unsupported client: {client_name}')
+                raise RPCError(BAD_REQUEST, f"unsupported client: {client_name}")
             if self.client_version != client_name[:17]:
-                self.session_manager.session_count_metric.labels(version=self.client_version).dec()
+                self.session_manager.session_count_metric.labels(
+                    version=self.client_version
+                ).dec()
                 self.client_version = client_name[:17]
-                self.session_manager.session_count_metric.labels(version=self.client_version).inc()
-        self.session_manager.client_version_metric.labels(version=self.client_version).inc()
+                self.session_manager.session_count_metric.labels(
+                    version=self.client_version
+                ).inc()
+        self.session_manager.client_version_metric.labels(
+            version=self.client_version
+        ).inc()
 
         # Find the highest common protocol version.  Disconnect if
         # that protocol version in unsupported.
-        ptuple, client_min = protocol_version(client_version, self.PROTOCOL_MIN, self.PROTOCOL_MAX)
+        ptuple, client_min = protocol_version(
+            client_version, self.PROTOCOL_MIN, self.PROTOCOL_MAX
+        )
         if ptuple is None:
             ptuple, client_min = protocol_version(client_version, (1, 1, 0), (1, 4, 0))
             if ptuple is None:
                 self.close_after_send = True
-                raise RPCError(BAD_REQUEST, f'unsupported protocol version: {client_version}')
+                raise RPCError(
+                    BAD_REQUEST, f"unsupported protocol version: {client_version}"
+                )
 
         self.protocol_tuple = ptuple
         self.protocol_string = version_string(ptuple)
@@ -1733,27 +1929,46 @@ class LBRYElectrumX(asyncio.Protocol):
         try:
             hex_hash = await self.session_manager.broadcast_transaction(raw_tx)
             self.txs_sent += 1
-            # self.mempool.wakeup.set()
-            # await asyncio.sleep(0.5)
-            self.logger.info(f'sent tx: {hex_hash}')
+            try:
+                touched = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    self.mempool.inject_transaction,
+                    bytes.fromhex(hex_hash)[::-1],
+                    bytes.fromhex(raw_tx),
+                )
+                if touched:
+                    self.session_manager.clear_caches()
+                    self.session_manager.search_index.clear_caches()
+                    await self.mempool.on_mempool(set(), touched, self.db.db_height)
+            except Exception:
+                self.logger.exception(
+                    "failed to inject broadcast tx %s into live mempool state",
+                    hex_hash,
+                )
+            self.logger.info(f"sent tx: {hex_hash}")
             return hex_hash
         except DaemonError as e:
-            error, = e.args
-            message = error['message']
-            self.logger.info(f'error sending transaction: {message}')
-            raise RPCError(BAD_REQUEST, 'the transaction was rejected by '
-                                        f'network rules.\n\n{message}\n[{raw_tx}]')
+            (error,) = e.args
+            message = error["message"]
+            self.logger.info(f"error sending transaction: {message}")
+            raise RPCError(
+                BAD_REQUEST,
+                "the transaction was rejected by "
+                f"network rules.\n\n{message}\n[{raw_tx}]",
+            )
 
     async def transaction_info(self, tx_hash: str):
         tx_info = (await self.transaction_get_batch(tx_hash))[tx_hash]
-        if tx_info[0] is None and tx_info[1]['block_height'] == -1:
+        if tx_info[0] is None and tx_info[1]["block_height"] == -1:
             return RPCError(BAD_REQUEST, "No such mempool or blockchain transaction.")
         return tx_info
 
     async def transaction_get_batch(self, *tx_hashes):
         self.session_manager.tx_request_count_metric.inc(len(tx_hashes))
         if len(tx_hashes) > 100:
-            raise RPCError(BAD_REQUEST, f'too many tx hashes in request: {len(tx_hashes)}')
+            raise RPCError(
+                BAD_REQUEST, f"too many tx hashes in request: {len(tx_hashes)}"
+            )
         for tx_hash in tx_hashes:
             assert_tx_hash(tx_hash)
         batch_result = await self.db.get_transactions_and_merkles(tx_hashes)
@@ -1770,7 +1985,9 @@ class LBRYElectrumX(asyncio.Protocol):
         verbose = bool(verbose)
         tx_hash_bytes = bytes.fromhex(txid)[::-1]
 
-        raw_tx = await asyncio.get_event_loop().run_in_executor(None, self.db.get_raw_tx, tx_hash_bytes)
+        raw_tx = await asyncio.get_event_loop().run_in_executor(
+            None, self.db.get_raw_tx, tx_hash_bytes
+        )
         if raw_tx:
             if not verbose:
                 return raw_tx.hex()
@@ -1797,9 +2014,10 @@ class LBRYElectrumX(asyncio.Protocol):
         """
         assert_tx_hash(tx_hash)
         result = await self.transaction_get_batch(tx_hash)
-        if tx_hash not in result or result[tx_hash][1]['block_height'] <= 0:
-            raise RPCError(BAD_REQUEST, f'tx hash {tx_hash} not in '
-                                        f'block at height {height:,d}')
+        if tx_hash not in result or result[tx_hash][1]["block_height"] <= 0:
+            raise RPCError(
+                BAD_REQUEST, f"tx hash {tx_hash} not in block at height {height:,d}"
+            )
         return result[tx_hash][1]
 
 
@@ -1814,19 +2032,28 @@ def format_release_time(release_time):
     # also set a default so we dont show claims in the future
     def roundup_time(number, factor=360):
         return int(1 + int(number / factor)) * factor
+
     if isinstance(release_time, str) and len(release_time) > 0:
         # Validate string length to prevent DoS with extremely long inputs
         if len(release_time) > 100:
-            raise ValueError(f'release_time string too long: {len(release_time)} characters')
-        time_digits = ''.join(filter(str.isdigit, release_time))
+            raise ValueError(
+                f"release_time string too long: {len(release_time)} characters"
+            )
+        time_digits = "".join(filter(str.isdigit, release_time))
         # Validate that we have digits and they form a reasonable number
         if not time_digits:
-            raise ValueError('release_time must contain digits')
-        if len(time_digits) > 20:  # Unix timestamps are ~10 digits, give generous buffer
-            raise ValueError(f'release_time contains too many digits: {len(time_digits)}')
-        time_prefix = release_time[:-len(time_digits)]
+            raise ValueError("release_time must contain digits")
+        if (
+            len(time_digits) > 20
+        ):  # Unix timestamps are ~10 digits, give generous buffer
+            raise ValueError(
+                f"release_time contains too many digits: {len(time_digits)}"
+            )
+        time_prefix = release_time[: -len(time_digits)]
         return time_prefix + str(roundup_time(int(time_digits)))
     elif isinstance(release_time, int):
         return roundup_time(release_time)
     else:
-        raise ValueError(f'release_time must be a string or int, got {type(release_time).__name__}')
+        raise ValueError(
+            f"release_time must be a string or int, got {type(release_time).__name__}"
+        )

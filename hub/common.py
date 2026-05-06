@@ -539,7 +539,10 @@ class LargestValueCache:
     def set(self, key, value) -> bool:
         if self._capacity == 0:
             return False
-        if self.full:
+        if key in self._cache:
+            old_value = self._cache[key]
+            self._raw_cache.remove(LargestValueCacheItem(key, old_value))
+        elif self.full:
             if len(value) < len(self._raw_cache[0].value):
                 return False
             popped = self._raw_cache.popleft()
@@ -836,7 +839,7 @@ def expand_query(**kwargs):
         kwargs['name'] = normalize_name(kwargs.pop('name'))
     if kwargs.get('is_controlling') is False:
         kwargs.pop('is_controlling')
-    query = {'must': [], 'must_not': []}
+    query = {'filter': [], 'must': [], 'must_not': []}
     collapse = None
     shorts_aspect_ratio_lte = kwargs.pop('exclude_shorts_aspect_ratio_lte', 0.95)
     shorts_duration_lte = kwargs.pop('exclude_shorts_duration_lte', 180)
@@ -863,8 +866,8 @@ def expand_query(**kwargs):
             include_missing = True
             key = key[:-len('_or_missing')]
         many = key.endswith('__in') or isinstance(value, list)
-        if many and len(value) > 2048:
-            raise TooManyClaimSearchParametersError(key, 2048)
+        if many and len(value) > 3072:
+            raise TooManyClaimSearchParametersError(key, 3072)
         if many:
             key = key.replace('__in', '')
             value = list(filter(None, value))
@@ -893,7 +896,7 @@ def expand_query(**kwargs):
                 key += '.keyword'
             ops = {'<=': 'lte', '>=': 'gte', '<': 'lt', '>': 'gt'}
             if partial_id:
-                query['must'].append({"prefix": {key: value}})
+                query['filter'].append({"prefix": {key: value}})
             elif key in RANGE_FIELDS and isinstance(value, str) and value[0] in ops:
                 operator_length = 2 if value[:2] in ops else 1
                 operator, value = value[:operator_length], value[operator_length:]
@@ -902,7 +905,7 @@ def expand_query(**kwargs):
                 range_clause = {"range": {key: {ops[operator]: value}}}
                 if include_missing:
                     range_clause = wrap_range_with_missing(key, range_clause)
-                query['must'].append(range_clause)
+                query['filter'].append(range_clause)
             elif key in RANGE_FIELDS and isinstance(value, list) and all(v[0] in ops for v in value):
                 range_constraints = []
                 release_times = []
@@ -919,36 +922,36 @@ def expand_query(**kwargs):
                     range_clause = {"range": {key: {ops[operator]: v for operator, v in range_constraints}}}
                     if include_missing:
                         range_clause = wrap_range_with_missing(key, range_clause)
-                    query['must'].append(range_clause)
+                    query['filter'].append(range_clause)
                 else:
                     range_clause = {"range": {key: {ops[operator]: v for operator, v in release_times}}}
-                    query['must'].append(wrap_range_with_missing(key, range_clause))
+                    query['filter'].append(wrap_range_with_missing(key, range_clause))
             elif many:
-                query['must'].append({"terms": {key: value}})
+                query['filter'].append({"terms": {key: value}})
             else:
                 if key == 'fee_amount':
                     value = str(Decimal(value)*1000)
-                query['must'].append({"term": {key: {"value": value}}})
+                query['filter'].append({"term": {key: {"value": value}}})
         elif key == 'not_channel_ids':
             for channel_id in value:
                 query['must_not'].append({"term": {'channel_id.keyword': channel_id}})
                 query['must_not'].append({"term": {'_id': channel_id}})
         elif key == 'channel_ids':
-            query['must'].append({"terms": {'channel_id.keyword': value}})
+            query['filter'].append({"terms": {'channel_id.keyword': value}})
         elif key == 'claim_ids':
-            query['must'].append({"terms": {'claim_id.keyword': value}})
+            query['filter'].append({"terms": {'claim_id.keyword': value}})
         elif key == 'media_types':
-            query['must'].append({"terms": {'media_type.keyword': value}})
+            query['filter'].append({"terms": {'media_type.keyword': value}})
         elif key == 'any_languages':
-            query['must'].append({"terms": {'languages': clean_tags(value)}})
+            query['filter'].append({"terms": {'languages': clean_tags(value)}})
         elif key == 'any_languages':
-            query['must'].append({"terms": {'languages': value}})
+            query['filter'].append({"terms": {'languages': value}})
         elif key == 'all_languages':
-            query['must'].extend([{"term": {'languages': tag}} for tag in value])
+            query['filter'].extend([{"term": {'languages': tag}} for tag in value])
         elif key == 'any_tags':
-            query['must'].append({"terms": {'tags.keyword': clean_tags(value)}})
+            query['filter'].append({"terms": {'tags.keyword': clean_tags(value)}})
         elif key == 'all_tags':
-            query['must'].extend([{"term": {'tags.keyword': tag}} for tag in clean_tags(value)])
+            query['filter'].extend([{"term": {'tags.keyword': tag}} for tag in clean_tags(value)])
         elif key == 'not_tags':
             query['must_not'].extend([{"term": {'tags.keyword': tag}} for tag in clean_tags(value)])
         elif key == 'not_claim_id':
@@ -968,11 +971,11 @@ def expand_query(**kwargs):
                 }
             })
     if kwargs.get('has_channel_signature'):
-        query['must'].append({"exists": {"field": "signature"}})
+        query['filter'].append({"exists": {"field": "signature"}})
         if 'signature_valid' in kwargs:
-            query['must'].append({"term": {"is_signature_valid": bool(kwargs["signature_valid"])}})
+            query['filter'].append({"term": {"is_signature_valid": bool(kwargs["signature_valid"])}})
     elif 'signature_valid' in kwargs:
-        query['must'].append(
+        query['filter'].append(
             {"bool":
                 {"should": [
                     {"bool": {"must_not": {"exists": {"field": "signature"}}}},
@@ -982,7 +985,7 @@ def expand_query(**kwargs):
         )
     if 'has_source' in kwargs:
         is_stream_or_repost_terms = {"terms": {"claim_type": [CLAIM_TYPES['stream'], CLAIM_TYPES['repost']]}}
-        query['must'].append(
+        query['filter'].append(
             {"bool": {
                 "should": [
                     {"bool": {
@@ -1038,6 +1041,14 @@ def expand_query(**kwargs):
                 "sort": query["sort"]
             }
         }
+    # When no explicit sort is set, ES falls back to _score. Collapse filter
+    # clauses back into must so the scoring context is preserved for callers
+    # that rely on the current ordering. Filter clauses prepend so that any
+    # simple_query_string clause (appended last earlier) stays last and the
+    # emitted shape is byte-identical to the pre-change builder.
+    if not query["sort"]:
+        bool_clauses = query['query']['bool']
+        bool_clauses['must'] = bool_clauses.pop('filter', []) + bool_clauses.get('must', [])
     return query
 
 
