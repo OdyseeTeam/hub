@@ -6,8 +6,12 @@ from operator import itemgetter
 from typing import TYPE_CHECKING, Deque, List, Optional, Tuple
 
 from elasticsearch import AsyncElasticsearch, ConnectionError, NotFoundError
+from prometheus_client import Counter as PrometheusCounter
+from prometheus_client import Histogram
 
+from hub import PROMETHEUS_NAMESPACE
 from hub.common import (
+    HISTOGRAM_BUCKETS,
     INDEX_DEFAULT_SETTINGS,
     IndexVersionMismatch,
     LRUCache,
@@ -18,9 +22,29 @@ from hub.db.common import ResolveResult
 from hub.schema.result import Censor, Outputs
 
 if TYPE_CHECKING:
-    from prometheus_client import Counter as PrometheusCounter
-
     from hub.db import SecondaryDB
+
+
+NAMESPACE = f"{PROMETHEUS_NAMESPACE}_hub"
+
+es_search_took_seconds = Histogram(
+    "es_search_took_seconds",
+    "Time Elasticsearch reported spending on a search request (from es_resp['took'])",
+    namespace=NAMESPACE,
+    buckets=HISTOGRAM_BUCKETS,
+)
+herald_expand_query_path = PrometheusCounter(
+    "herald_expand_query_path",
+    "Reader-side search queries grouped by whether expand_query emitted a filter-context or must-fallback query",
+    namespace=NAMESPACE,
+    labelnames=("path",),
+)
+herald_search_cache_hit = PrometheusCounter(
+    "herald_search_cache_hit",
+    "Herald search-path cache checks by layer and hit/miss result",
+    namespace=NAMESPACE,
+    labelnames=("layer", "result"),
+)
 
 
 class ChannelResolution(str):
@@ -187,10 +211,13 @@ class SearchIndex:
         total_referenced = []
         cache_item = ResultCacheItem.from_cache(str(kwargs), self.search_cache)
         if cache_item.result is not None:
+            herald_search_cache_hit.labels(layer="cached_search", result="hit").inc()
             return cache_item.result
         async with cache_item.lock:
-            if cache_item.result:
+            if cache_item.result is not None:
+                herald_search_cache_hit.labels(layer="cached_search", result="hit").inc()
                 return cache_item.result
+            herald_search_cache_hit.labels(layer="cached_search", result="miss").inc()
             response, offset, total = await self.search(**kwargs)
             censored = {}
             for row in response:
@@ -280,13 +307,19 @@ class SearchIndex:
             f"ahead{per_channel_per_page}{kwargs}", self.search_cache
         )
         if cache_item.result is not None:
+            herald_search_cache_hit.labels(layer="search_ahead", result="hit").inc()
             reordered_hits = cache_item.result
         else:
             async with cache_item.lock:
-                if cache_item.result:
+                if cache_item.result is not None:
+                    herald_search_cache_hit.labels(layer="search_ahead", result="hit").inc()
                     reordered_hits = cache_item.result
                 else:
+                    herald_search_cache_hit.labels(layer="search_ahead", result="miss").inc()
                     query = expand_query(**kwargs)
+                    herald_expand_query_path.labels(
+                        path="filter" if query.get("sort") else "must_fallback"
+                    ).inc()
                     es_resp = await self.search_client.search(
                         query,
                         index=self.index,
@@ -299,6 +332,9 @@ class SearchIndex:
                             "creation_height",
                         ],
                     )
+                    es_took_ms = es_resp.get("took")
+                    if es_took_ms is not None:
+                        es_search_took_seconds.observe(es_took_ms / 1000.0)
                     search_hits = deque(es_resp["hits"]["hits"])
                     if self.timeout_counter and es_resp["timed_out"]:
                         self.timeout_counter.inc()
