@@ -124,9 +124,9 @@ sudo systemctl start lbcd-tunnel.service
 ```
   - Build the hub docker image on the hub instance by running the following:
 ```
-git clone https://github.com/lbryio/hub.git
+git clone https://github.com/OdyseeTeam/hub.git
 cd hub
-docker build -t lbry/hub:development .
+docker build -t odyseeteam/hub:development .
 ```
   - Copy the following to `~/docker-compose.yml` on the hub instance
 ```
@@ -139,7 +139,7 @@ services:
   scribe:
     depends_on:
       - scribe_elastic_sync
-    image: lbry/hub:${SCRIBE_TAG:-master}
+    image: odyseeteam/hub:${SCRIBE_TAG:-master}
     restart: always
     network_mode: host
     volumes:
@@ -153,7 +153,7 @@ services:
       - "--cache_all_tx_hashes"
       - "--index_address_statuses"
   scribe_elastic_sync:
-    image: lbry/hub:${SCRIBE_TAG:-master}
+    image: odyseeteam/hub:${SCRIBE_TAG:-master}
     restart: always
     network_mode: host
     ports:
@@ -172,7 +172,7 @@ services:
     depends_on:
       - scribe_elastic_sync
       - scribe
-    image: lbry/hub:${SCRIBE_TAG:-master}
+    image: odyseeteam/hub:${SCRIBE_TAG:-master}
     restart: always
     network_mode: host
     ports:

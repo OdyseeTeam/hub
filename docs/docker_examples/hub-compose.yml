@@ -7,7 +7,7 @@ services:
   scribe:
     depends_on:
       - scribe_elastic_sync
-    image: lbry/hub:${SCRIBE_TAG:-master}
+    image: odyseeteam/hub:${SCRIBE_TAG:-master}
     restart: always
     network_mode: host
     volumes:
@@ -19,7 +19,7 @@ services:
       - "--daemon_url=http://lbry:lbry@127.0.0.1:9245"
       - "--max_query_workers=2"
   scribe_elastic_sync:
-    image: lbry/hub:${SCRIBE_TAG:-master}
+    image: odyseeteam/hub:${SCRIBE_TAG:-master}
     restart: always
     network_mode: host
     ports:
@@ -38,7 +38,7 @@ services:
     depends_on:
       - scribe_elastic_sync
       - scribe
-    image: lbry/hub:${SCRIBE_TAG:-master}
+    image: odyseeteam/hub:${SCRIBE_TAG:-master}
     restart: always
     network_mode: host
     ports:

@@ -18,18 +18,18 @@ Features and overview of `hub` as a python library:
 
 Scribe may be run from source, a binary, or a docker image.
 Our [releases page](https://github.com/lbryio/hub/releases) contains pre-built binaries of the latest release, pre-releases, and past releases for macOS and Debian-based Linux.
-Prebuilt [docker images](https://hub.docker.com/r/lbry/hub/tags) are also available.
+Prebuilt [docker images](https://hub.docker.com/r/odyseeteam/hub/tags) are also available.
 
 ### Prebuilt docker image
 
-`docker pull lbry/hub:master`
+`docker pull odyseeteam/hub:master`
 
 ### Build your own docker image
 
 ```
-git clone https://github.com/lbryio/hub.git
+git clone https://github.com/OdyseeTeam/hub.git
 cd hub
-docker build -t lbry/hub:development .
+docker build -t odyseeteam/hub:development .
 ```
 
 ### Install from source
