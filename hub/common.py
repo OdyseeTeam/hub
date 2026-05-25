@@ -13,7 +13,7 @@ from collections import deque
 from decimal import Decimal
 from typing import Iterable, Deque
 from asyncio import get_event_loop, Event
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge
 from rehash.structs import EVPobject
 from hub.schema.tags import clean_tags
 from hub.schema.url import normalize_name
@@ -36,6 +36,7 @@ HISTOGRAM_BUCKETS = (
 SIZE_BUCKETS = (
     1, 10, 100, 500, 1000, 2000, 4000, 7500, 10000, 15000, 25000, 50000, 75000, 100000, 150000, 250000, float('inf')
 )
+_CACHE_METRIC_GAUGES = {}
 
 CLAIM_TYPES = {
     'stream': 1,
@@ -155,18 +156,120 @@ def protocol_version(client_req, min_tuple, max_tuple):
     return result, client_min
 
 
+def _estimate_cache_value_size(value_size, value):
+    if value_size is None:
+        return 0
+    try:
+        size = value_size(value)
+    except Exception:
+        log.debug("failed to estimate cache value size", exc_info=True)
+        return 0
+    if size is None:
+        return 0
+    return max(0, int(size))
+
+
+def _get_cache_metric_gauge(name, documentation, namespace, registry=None):
+    key = (registry, namespace, name)
+    gauge = _CACHE_METRIC_GAUGES.get(key)
+    if gauge is not None:
+        return gauge
+    kwargs = {
+        "namespace": namespace,
+        "labelnames": ("cache",),
+    }
+    if registry is not None:
+        kwargs["registry"] = registry
+    try:
+        gauge = Gauge(name, documentation, **kwargs)
+    except ValueError as err:
+        log.debug("failed to set up prometheus %s metric: %s", name, err)
+        return None
+    _CACHE_METRIC_GAUGES[key] = gauge
+    return gauge
+
+
+def _cache_stat(cache, name):
+    return cache.stats().get(name, 0)
+
+
+def _set_cache_metric(
+    cache_name, cache, namespace, metric_name, documentation, stat_name, registry=None
+):
+    gauge = _get_cache_metric_gauge(metric_name, documentation, namespace, registry)
+    if gauge is not None:
+        gauge.labels(cache=cache_name).set_function(
+            lambda: _cache_stat(cache, stat_name)
+        )
+
+
+def _remove_cache_metric(cache_name, namespace, metric_name, registry=None):
+    gauge = _CACHE_METRIC_GAUGES.get((registry, namespace, metric_name))
+    if gauge is None:
+        return
+    try:
+        gauge.remove(cache_name)
+    except KeyError:
+        pass
+
+
+def register_cache_metrics(cache_name, cache, namespace, registry=None):
+    stats = cache.stats()
+    _set_cache_metric(
+        cache_name, cache, namespace, "cache_entries", "Current cache entry count",
+        "entries", registry
+    )
+    _set_cache_metric(
+        cache_name, cache, namespace, "cache_capacity", "Configured cache capacity",
+        "capacity", registry
+    )
+    if "estimated_bytes" in stats:
+        _set_cache_metric(
+            cache_name, cache, namespace, "cache_estimated_bytes",
+            "Estimated retained cache bytes", "estimated_bytes", registry
+        )
+    else:
+        _remove_cache_metric(cache_name, namespace, "cache_estimated_bytes", registry)
+    if "value_items" in stats:
+        _set_cache_metric(
+            cache_name, cache, namespace, "cache_value_items",
+            "Current retained cache value items", "value_items", registry
+        )
+    else:
+        _remove_cache_metric(cache_name, namespace, "cache_value_items", registry)
+    if "largest_value_items" in stats:
+        _set_cache_metric(
+            cache_name, cache, namespace, "cache_largest_value_items",
+            "Largest retained cache value item count", "largest_value_items", registry
+        )
+    else:
+        _remove_cache_metric(cache_name, namespace, "cache_largest_value_items", registry)
+
+
 class LRUCacheWithMetrics:
     __slots__ = [
         'capacity',
         'cache',
+        '_estimated_bytes',
         '_track_metrics',
+        '_value_size',
+        '_value_sizes',
         'hits',
         'misses'
     ]
 
-    def __init__(self, capacity: int, metric_name: typing.Optional[str] = None, namespace: str = "daemon_cache"):
+    def __init__(
+        self,
+        capacity: int,
+        metric_name: typing.Optional[str] = None,
+        namespace: str = "daemon_cache",
+        value_size: typing.Optional[typing.Callable[[typing.Any], int]] = None
+    ):
         self.capacity = capacity
         self.cache = collections.OrderedDict()
+        self._estimated_bytes = 0
+        self._value_size = value_size
+        self._value_sizes = {} if value_size is not None else None
         if metric_name is None:
             self._track_metrics = False
             self.hits = self.misses = None
@@ -196,19 +299,50 @@ class LRUCacheWithMetrics:
         self.cache[key] = value
         return value
 
+    def _add_size(self, key, value):
+        if self._value_size is None:
+            return
+        size = _estimate_cache_value_size(self._value_size, value)
+        self._value_sizes[key] = size
+        self._estimated_bytes += size
+
+    def _remove_size(self, key):
+        if self._value_size is None:
+            return
+        self._estimated_bytes -= self._value_sizes.pop(key, 0)
+
     def set(self, key, value):
+        if self.capacity == 0:
+            return
         try:
             self.cache.pop(key)
+            self._remove_size(key)
         except KeyError:
             if len(self.cache) >= self.capacity:
-                self.cache.popitem(last=False)
+                old_key, _ = self.cache.popitem(last=False)
+                self._remove_size(old_key)
         self.cache[key] = value
+        self._add_size(key, value)
 
     def clear(self):
         self.cache.clear()
+        if self._value_sizes is not None:
+            self._value_sizes.clear()
+        self._estimated_bytes = 0
 
     def pop(self, key):
-        return self.cache.pop(key)
+        value = self.cache.pop(key)
+        self._remove_size(key)
+        return value
+
+    def stats(self):
+        stats = {
+            "entries": len(self.cache),
+            "capacity": self.capacity,
+        }
+        if self._value_size is not None:
+            stats["estimated_bytes"] = self._estimated_bytes
+        return stats
 
     def __setitem__(self, key, value):
         return self.set(key, value)
@@ -224,6 +358,7 @@ class LRUCacheWithMetrics:
 
     def __delitem__(self, key):
         self.cache.pop(key)
+        self._remove_size(key)
 
     def __del__(self):
         self.clear()
@@ -232,12 +367,22 @@ class LRUCacheWithMetrics:
 class LRUCache:
     __slots__ = [
         'capacity',
-        'cache'
+        'cache',
+        '_estimated_bytes',
+        '_value_size',
+        '_value_sizes'
     ]
 
-    def __init__(self, capacity: int):
+    def __init__(
+        self,
+        capacity: int,
+        value_size: typing.Optional[typing.Callable[[typing.Any], int]] = None
+    ):
         self.capacity = capacity
         self.cache = collections.OrderedDict()
+        self._estimated_bytes = 0
+        self._value_size = value_size
+        self._value_sizes = {} if value_size is not None else None
 
     def get(self, key, default=None):
         try:
@@ -247,22 +392,56 @@ class LRUCache:
         self.cache[key] = value
         return value
 
+    def _add_size(self, key, value):
+        if self._value_size is None:
+            return
+        size = _estimate_cache_value_size(self._value_size, value)
+        self._value_sizes[key] = size
+        self._estimated_bytes += size
+
+    def _remove_size(self, key):
+        if self._value_size is None:
+            return
+        self._estimated_bytes -= self._value_sizes.pop(key, 0)
+
     def set(self, key, value):
+        if self.capacity == 0:
+            return
         try:
             self.cache.pop(key)
+            self._remove_size(key)
         except KeyError:
             if len(self.cache) >= self.capacity:
-                self.cache.popitem(last=False)
+                old_key, _ = self.cache.popitem(last=False)
+                self._remove_size(old_key)
         self.cache[key] = value
+        self._add_size(key, value)
 
     def items(self):
         return self.cache.items()
 
     def clear(self):
         self.cache.clear()
+        if self._value_sizes is not None:
+            self._value_sizes.clear()
+        self._estimated_bytes = 0
 
     def pop(self, key, default=None):
-        return self.cache.pop(key, default)
+        try:
+            value = self.cache.pop(key)
+        except KeyError:
+            return default
+        self._remove_size(key)
+        return value
+
+    def stats(self):
+        stats = {
+            "entries": len(self.cache),
+            "capacity": self.capacity,
+        }
+        if self._value_size is not None:
+            stats["estimated_bytes"] = self._estimated_bytes
+        return stats
 
     def __setitem__(self, key, value):
         return self.set(key, value)
@@ -278,6 +457,7 @@ class LRUCache:
 
     def __delitem__(self, key):
         self.cache.pop(key)
+        self._remove_size(key)
 
     def __del__(self):
         self.clear()
@@ -376,10 +556,17 @@ class CacheNode:
 
 
 class LFUCache:
-    def __init__(self, capacity: int):
+    def __init__(
+        self,
+        capacity: int,
+        value_size: typing.Optional[typing.Callable[[typing.Any], int]] = None
+    ):
         self.cache = {}
         self.weights = LinkedList()
         self.capacity = capacity
+        self._estimated_bytes = 0
+        self._value_size = value_size
+        self._value_sizes = {} if value_size is not None else None
 
     def increment_weight(self, cache_node: CacheNode):
         weight_node = cache_node.weight_node
@@ -392,11 +579,25 @@ class LFUCache:
         if weight_node.cache_nodes.size == 0:
             self.weights.remove(weight_node)
 
+    def _add_size(self, key, value):
+        if self._value_size is None:
+            return
+        size = _estimate_cache_value_size(self._value_size, value)
+        self._value_sizes[key] = size
+        self._estimated_bytes += size
+
+    def _remove_size(self, key):
+        if self._value_size is None:
+            return
+        self._estimated_bytes -= self._value_sizes.pop(key, 0)
+
     def set(self, key, value):
         if key in self.cache:
             data_node = self.cache[key]
             self.increment_weight(data_node)
+            self._remove_size(key)
             data_node.value = value
+            self._add_size(key, value)
             return
         if len(self.cache) == self.capacity:
             if self.capacity == 0:
@@ -405,6 +606,7 @@ class LFUCache:
             to_remove = lowest_data_list.head
             lowest_data_list.remove(to_remove)
             self.cache.pop(to_remove.key)
+            self._remove_size(to_remove.key)
             if lowest_data_list.size == 0:
                 self.weights.remove(self.weights.head)
         if not (self.weights.head and self.weights.head.weight == 1):
@@ -412,6 +614,7 @@ class LFUCache:
         new_cache_node = CacheNode(key=key, value=value, weight_node=self.weights.head)
         self.weights.head.cache_nodes.append(new_cache_node)
         self.cache[key] = new_cache_node
+        self._add_size(key, value)
 
     def get(self, key):
         if key in self.cache:
@@ -434,13 +637,26 @@ class LFUCache:
     def clear(self):
         self.cache.clear()
         self.weights.clear()
+        if self._value_sizes is not None:
+            self._value_sizes.clear()
+        self._estimated_bytes = 0
 
     def pop(self, key):
         cache_node = self.cache.pop(key)
         weight_node = cache_node.weight_node
         weight_node.cache_nodes.remove(cache_node)
+        self._remove_size(key)
         if weight_node.cache_nodes.size == 0:
             self.weights.remove(weight_node)
+
+    def stats(self):
+        stats = {
+            "entries": len(self.cache),
+            "capacity": self.capacity,
+        }
+        if self._value_size is not None:
+            stats["estimated_bytes"] = self._estimated_bytes
+        return stats
 
     def __contains__(self, item) -> bool:
         return item in self.cache
@@ -449,6 +665,7 @@ class LFUCache:
         item = self.cache.pop(key)
         weight_node = item.weight_node
         weight_node.cache_nodes.remove(item)
+        self._remove_size(key)
         if weight_node.cache_nodes.size == 0:
             self.weights.remove(weight_node)
 
@@ -457,8 +674,14 @@ class LFUCache:
 
 
 class LFUCacheWithMetrics(LFUCache):
-    def __init__(self, capacity: int, metric_name: typing.Optional[str] = None, namespace: str = "daemon_cache"):
-        super().__init__(capacity)
+    def __init__(
+        self,
+        capacity: int,
+        metric_name: typing.Optional[str] = None,
+        namespace: str = "daemon_cache",
+        value_size: typing.Optional[typing.Callable[[typing.Any], int]] = None
+    ):
+        super().__init__(capacity, value_size)
         if metric_name is None:
             self._track_metrics = False
             self.hits = self.misses = None
@@ -511,20 +734,28 @@ class LargestValueCacheItem:
         return len(self.value) <= len(other.value)
 
     def __eq__(self, other):
-        return len(self.value) == len(other.value)
+        if not isinstance(other, LargestValueCacheItem):
+            return NotImplemented
+        return self.key == other.key and len(self.value) == len(other.value)
 
 
 class LargestValueCache:
     __slots__ = [
         '_capacity',
         '_cache',
-        '_raw_cache'
+        '_raw_cache',
+        '_value_size'
     ]
 
-    def __init__(self, capacity: int):
+    def __init__(
+        self,
+        capacity: int,
+        value_size: typing.Optional[typing.Callable[[typing.Any], int]] = None
+    ):
         self._capacity = max(capacity, 0)
         self._cache = {}
         self._raw_cache: Deque[LargestValueCacheItem] = deque(maxlen=capacity)
+        self._value_size = value_size
 
     def items(self):
         return self._cache.items()
@@ -552,6 +783,13 @@ class LargestValueCache:
         insort_right(self._raw_cache, item)
         return True
 
+    def extend_value(self, key, values):
+        value = self._cache[key]
+        self._raw_cache.remove(LargestValueCacheItem(key, value))
+        value.extend(values)
+        insort_right(self._raw_cache, LargestValueCacheItem(key, value))
+        return value
+
     def clear(self):
         self._cache.clear()
         self._raw_cache.clear()
@@ -560,6 +798,21 @@ class LargestValueCache:
         value = self._cache.pop(key)
         self._raw_cache.remove(LargestValueCacheItem(key, value))
         return value
+
+    def stats(self):
+        value_items = [len(value) for value in self._cache.values()]
+        stats = {
+            "entries": len(self._cache),
+            "capacity": self._capacity,
+            "value_items": sum(value_items),
+            "largest_value_items": max(value_items) if value_items else 0,
+        }
+        if self._value_size is not None:
+            stats["estimated_bytes"] = sum(
+                _estimate_cache_value_size(self._value_size, value)
+                for value in self._cache.values()
+            )
+        return stats
 
     def __setitem__(self, key, value):
         return self.set(key, value)

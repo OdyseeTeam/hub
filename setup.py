@@ -32,7 +32,8 @@ setup(
         'aiohttp==3.7.4',
         'certifi>=2021.10.08',
         'colorama==0.3.7',
-        'cffi==1.13.2',
+        'cffi==1.15.1; python_version < "3.8"',
+        'cffi==1.16.0; python_version >= "3.8"',
         'protobuf==3.18.3',
         'msgpack==0.6.1',
         'prometheus_client==0.7.1',
@@ -42,7 +43,7 @@ setup(
         'elasticsearch==7.10.1',
         'hachoir==3.1.2',
         'filetype==1.0.9',
-        'grpcio==1.38.0',
+        'grpcio==1.62.3',
         'lbry-rocksdb==0.8.2',
         'ujson==5.4.0',
         'rehash==1.0.0'

@@ -4,6 +4,7 @@ import base64
 import logging
 import os
 import struct
+import sys
 import time
 import typing
 import zlib
@@ -28,6 +29,7 @@ from hub.common import (
     LRUCacheWithMetrics,
     ResumableSHA256,
     hash_to_hex_str,
+    register_cache_metrics,
 )
 from hub.db.common import UTXO, DBError, ExpandedResolveResult, ResolveResult
 from hub.db.merkle import FastMerkleCacheItem, Merkle, MerkleCache
@@ -55,6 +57,10 @@ TXO_STRUCT = struct.Struct(b">LH")
 TXO_STRUCT_unpack = TXO_STRUCT.unpack
 TXO_STRUCT_pack = TXO_STRUCT.pack
 NAMESPACE = f"{PROMETHEUS_NAMESPACE}_db"
+
+
+def tx_cache_value_size(value):
+    return sys.getsizeof(value) + sum(sys.getsizeof(item) for item in value)
 
 
 class SecondaryDB:
@@ -131,7 +137,8 @@ class SecondaryDB:
 
         # lru cache of tx_hash: (tx_bytes, tx_num, position, tx_height)
         self.tx_cache = LFUCacheWithMetrics(
-            tx_cache_size, metric_name="tx", namespace=NAMESPACE
+            tx_cache_size, metric_name="tx", namespace=NAMESPACE,
+            value_size=tx_cache_value_size
         )
         # lru cache of block heights to merkle trees of the block tx hashes
         self.merkle_cache = LFUCacheWithMetrics(
@@ -146,6 +153,10 @@ class SecondaryDB:
         self.short_url_cache = LRUCacheWithMetrics(
             2**16, metric_name="short_url", namespace=NAMESPACE
         )
+        register_cache_metrics("encoded_headers", self.encoded_headers, NAMESPACE)
+        register_cache_metrics("tx", self.tx_cache, NAMESPACE)
+        register_cache_metrics("merkle", self.merkle_cache, NAMESPACE)
+        register_cache_metrics("short_url", self.short_url_cache, NAMESPACE)
 
         self.genesis_bytes = bytes.fromhex(self.coin.GENESIS_HASH)
 

@@ -35,6 +35,7 @@ from hub.common import (
     hash_to_hex_str,
     hex_str_to_hash,
     protocol_version,
+    register_cache_metrics,
     sha256,
     version_string,
 )
@@ -68,6 +69,29 @@ SignatureInfo = namedtuple(
 class CachedAddressHistoryItem(TypedDict):
     tx_hash: str
     height: int
+
+
+_CACHED_ADDRESS_HISTORY_ITEM_BYTES = (
+    sys.getsizeof({"tx_hash": "0" * 64, "height": 0}) +
+    sys.getsizeof("0" * 64) +
+    sys.getsizeof(0)
+)
+
+
+def cached_address_history_item_size(value):
+    return (
+        sys.getsizeof(value) +
+        sys.getsizeof(value["tx_hash"]) +
+        sys.getsizeof(value["height"])
+    )
+
+
+def cached_history_value_size(history):
+    return sys.getsizeof(history) + len(history) * _CACHED_ADDRESS_HISTORY_ITEM_BYTES
+
+
+def raw_history_value_size(history):
+    return sys.getsizeof(history) + len(history) * sys.getsizeof(0)
 
 
 def scripthash_to_hashX(scripthash: str) -> bytes:
@@ -275,16 +299,22 @@ class SessionManager:
         self.running = False
         # hashX: List[int]
         self.hashX_raw_history_cache = LFUCacheWithMetrics(
-            env.hashX_history_cache_size, metric_name="raw_history", namespace=NAMESPACE
+            env.hashX_history_cache_size, metric_name="raw_history", namespace=NAMESPACE,
+            value_size=raw_history_value_size
         )
         # hashX: List[CachedAddressHistoryItem]
         self.hashX_history_cache = LargestValueCache(
-            env.largest_hashX_history_cache_size
+            env.largest_hashX_history_cache_size, value_size=cached_history_value_size
         )
         # tx_num: Tuple[txid, height]
         self.history_tx_info_cache = LFUCacheWithMetrics(
-            env.history_tx_cache_size, metric_name="history_tx", namespace=NAMESPACE
+            env.history_tx_cache_size, metric_name="history_tx", namespace=NAMESPACE,
+            value_size=cached_address_history_item_size
         )
+        register_cache_metrics("resolved_url", self.resolve_cache, NAMESPACE)
+        register_cache_metrics("raw_history", self.hashX_raw_history_cache, NAMESPACE)
+        register_cache_metrics("largest_history", self.hashX_history_cache, NAMESPACE)
+        register_cache_metrics("history_tx", self.history_tx_info_cache, NAMESPACE)
 
     def clear_caches(self):
         self.resolve_cache.clear()
@@ -306,11 +336,11 @@ class SessionManager:
                 if history_tx_nums is None:
                     history_tx_nums = self.db._read_history(hashX, None)
                 new_txs = history_tx_nums[len(full_cached) :]
-                update_history_cache[hashX] = full_cached, new_txs
+                update_history_cache[hashX] = new_txs
         if update_history_cache:
             # get the set of new tx nums that were touched in all of the new histories to be cached
             total_tx_nums = set()
-            for _, new_txs in update_history_cache.values():
+            for new_txs in update_history_cache.values():
                 total_tx_nums.update(new_txs)
             total_tx_nums = list(total_tx_nums)
             # collect the total new tx infos
@@ -327,10 +357,10 @@ class SessionManager:
             }
             # update the cached history lists
             get_referenced = referenced_new_txs.__getitem__
-            for hashX, (full, new_txs) in update_history_cache.items():
-                append_to_full = full.append
-                for tx_num in new_txs:
-                    append_to_full(get_referenced(tx_num))
+            for hashX, new_txs in update_history_cache.items():
+                self.hashX_history_cache.extend_value(
+                    hashX, (get_referenced(tx_num) for tx_num in new_txs)
+                )
 
     async def _start_server(self, kind, *args, **kw_args):
         loop = asyncio.get_event_loop()

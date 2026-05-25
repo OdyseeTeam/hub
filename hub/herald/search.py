@@ -17,6 +17,7 @@ from hub.common import (
     LRUCache,
     expand_query,
     expand_result,
+    register_cache_metrics,
 )
 from hub.db.common import ResolveResult
 from hub.schema.result import Censor, Outputs
@@ -85,6 +86,8 @@ class SearchIndex:
         self.logger = logging.getLogger(__name__)
         self.claim_cache = LRUCache(2**15)
         self.search_cache = LRUCache(2**17)
+        register_cache_metrics("search_claim", self.claim_cache, NAMESPACE)
+        register_cache_metrics("search_results", self.search_cache, NAMESPACE)
         self._elastic_services = elastic_services
         self.lost_connection = asyncio.Event()
 
