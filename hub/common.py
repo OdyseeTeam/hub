@@ -36,6 +36,14 @@ HISTOGRAM_BUCKETS = (
 SIZE_BUCKETS = (
     1, 10, 100, 500, 1000, 2000, 4000, 7500, 10000, 15000, 25000, 50000, 75000, 100000, 150000, 250000, float('inf')
 )
+SUBSCRIPTION_BUCKETS = (
+    ("0", 0, 0),
+    ("1_10", 1, 10),
+    ("11_100", 11, 100),
+    ("101_1000", 101, 1000),
+    ("1001_10000", 1001, 10000),
+    ("10001_plus", 10001, None),
+)
 _CACHE_METRIC_GAUGES = {}
 
 CLAIM_TYPES = {
@@ -167,6 +175,13 @@ def _estimate_cache_value_size(value_size, value):
     if size is None:
         return 0
     return max(0, int(size))
+
+
+def subscription_bucket_for_count(count):
+    for label, lower, upper in SUBSCRIPTION_BUCKETS:
+        if count >= lower and (upper is None or count <= upper):
+            return label
+    return "10001_plus"
 
 
 def _get_cache_metric_gauge(name, documentation, namespace, registry=None):

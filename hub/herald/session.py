@@ -24,6 +24,7 @@ from hub.common import (
     HASHX_LEN,
     HISTOGRAM_BUCKETS,
     SIZE_BUCKETS,
+    SUBSCRIPTION_BUCKETS,
     DaemonError,
     LargestValueCache,
     LFUCacheWithMetrics,
@@ -37,6 +38,7 @@ from hub.common import (
     protocol_version,
     register_cache_metrics,
     sha256,
+    subscription_bucket_for_count,
     version_string,
 )
 from hub.error import ResolveCensoredError, TooManyClaimSearchParametersError
@@ -44,7 +46,7 @@ from hub.herald import HUB_PROTOCOL_VERSION, PROTOCOL_MAX, PROTOCOL_MIN
 from hub.herald.common import Batch, BatchRequest, Notification, ProtocolError, Request
 from hub.herald.framer import NewlineFramer
 from hub.herald.jsonrpc import JSONRPC, JSONRPCAutoDetect, JSONRPCConnection, JSONRPCv2
-from hub.herald.search import SearchIndex
+from hub.herald.search import SearchIndex, search_phase_seconds
 from hub.schema.result import Outputs
 
 if typing.TYPE_CHECKING:
@@ -159,8 +161,19 @@ class SessionGroup:
 
 
 NAMESPACE = f"{PROMETHEUS_NAMESPACE}_hub"
-
-
+BYTE_BUCKETS = (
+    1024,
+    10 * 1024,
+    100 * 1024,
+    1024 * 1024,
+    10 * 1024 * 1024,
+    100 * 1024 * 1024,
+    1024 * 1024 * 1024,
+    10 * 1024 * 1024 * 1024,
+    100 * 1024 * 1024 * 1024,
+    float("inf"),
+)
+MESSAGE_COUNT_BUCKETS = (1, 10, 100, 1000, 10000, 100000, 1000000, float("inf"))
 class SessionManager:
     """Holds global state about all sessions."""
 
@@ -256,6 +269,47 @@ class SessionManager:
         namespace=NAMESPACE,
         buckets=HISTOGRAM_BUCKETS,
     )
+    session_subscriptions_count_metric = Gauge(
+        "session_subscriptions_count",
+        "Current address subscription count",
+        namespace=NAMESPACE,
+    )
+    session_subscriptions_max_metric = Gauge(
+        "session_subscriptions_max",
+        "Maximum current address subscriptions owned by one session",
+        namespace=NAMESPACE,
+    )
+    session_subscription_bucket_metric = Gauge(
+        "session_subscriptions_sessions",
+        "Current session count by address subscription count range",
+        namespace=NAMESPACE,
+        labelnames=("range",),
+    )
+    session_pending_items_count_metric = Gauge(
+        "session_pending_items_count",
+        "Current pending request item count across sessions",
+        namespace=NAMESPACE,
+    )
+    session_pending_items_max_metric = Gauge(
+        "session_pending_items_max",
+        "Maximum current pending request item count owned by one session",
+        namespace=NAMESPACE,
+    )
+    session_paused_count_metric = Gauge(
+        "session_paused_count",
+        "Current session count with paused writes",
+        namespace=NAMESPACE,
+    )
+    session_closing_count_metric = Gauge(
+        "session_closing_count",
+        "Current closing session count",
+        namespace=NAMESPACE,
+    )
+    session_groups_count_metric = Gauge(
+        "session_groups_count",
+        "Current session group count",
+        namespace=NAMESPACE,
+    )
 
     def __init__(
         self,
@@ -297,6 +351,7 @@ class SessionManager:
         self.session_event = Event()
 
         self.running = False
+        self._metrics_task = None
         # hashX: List[int]
         self.hashX_raw_history_cache = LFUCacheWithMetrics(
             env.hashX_history_cache_size, metric_name="raw_history", namespace=NAMESPACE,
@@ -315,6 +370,8 @@ class SessionManager:
         register_cache_metrics("raw_history", self.hashX_raw_history_cache, NAMESPACE)
         register_cache_metrics("largest_history", self.hashX_history_cache, NAMESPACE)
         register_cache_metrics("history_tx", self.history_tx_info_cache, NAMESPACE)
+        for bucket, _, _ in SUBSCRIPTION_BUCKETS:
+            self.session_subscription_bucket_metric.labels(bucket).set(0)
 
     def clear_caches(self):
         self.resolve_cache.clear()
@@ -449,6 +506,34 @@ class SessionManager:
     def _sub_count(self) -> int:
         return sum(s.sub_count() for s in self.sessions.values())
 
+    def snapshot_session_metrics(self):
+        sessions = list(self.sessions.values())
+        sub_counts = [session.sub_count() for session in sessions]
+        pending_counts = [session.count_pending_items() for session in sessions]
+        bucket_counts = {bucket: 0 for bucket, _, _ in SUBSCRIPTION_BUCKETS}
+        for sub_count in sub_counts:
+            bucket_counts[subscription_bucket_for_count(sub_count)] += 1
+        self.session_subscriptions_count_metric.set(sum(sub_counts))
+        self.session_subscriptions_max_metric.set(max(sub_counts) if sub_counts else 0)
+        for bucket, value in bucket_counts.items():
+            self.session_subscription_bucket_metric.labels(bucket).set(value)
+        self.session_pending_items_count_metric.set(sum(pending_counts))
+        self.session_pending_items_max_metric.set(
+            max(pending_counts) if pending_counts else 0
+        )
+        self.session_paused_count_metric.set(
+            sum(1 for session in sessions if not session._can_send.is_set())
+        )
+        self.session_closing_count_metric.set(
+            sum(1 for session in sessions if session.is_closing())
+        )
+        self.session_groups_count_metric.set(len(self._group_map()))
+
+    async def _snapshot_session_metrics_forever(self):
+        while True:
+            self.snapshot_session_metrics()
+            await asyncio.sleep(10)
+
     def _lookup_session(self, session_id):
         try:
             session_id = int(session_id)
@@ -491,7 +576,10 @@ class SessionManager:
                 if stale_sessions:
                     await asyncio.wait(
                         [
-                            session.close(force_after=session_timeout // 10)
+                            session.close(
+                                force_after=session_timeout // 10,
+                                reason="stale"
+                            )
                             for session in stale_sessions
                         ]
                     )
@@ -742,8 +830,17 @@ class SessionManager:
 
     async def start_other(self):
         self.running = True
+        if self._metrics_task is None:
+            self._metrics_task = asyncio.ensure_future(
+                self._snapshot_session_metrics_forever()
+            )
 
     async def stop_other(self):
+        if self._metrics_task and not self._metrics_task.done():
+            self._metrics_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._metrics_task
+        self._metrics_task = None
         self.running = False
 
     def session_count(self) -> int:
@@ -897,6 +994,55 @@ class LBRYElectrumX(asyncio.Protocol):
         namespace=NAMESPACE,
         labelnames=("version",),
     )
+    SESSION_LIFETIME_SENT_BYTES = Histogram(
+        "session_lifetime_sent_bytes",
+        "Bytes sent over a session lifetime",
+        namespace=NAMESPACE,
+        buckets=BYTE_BUCKETS,
+    )
+    SESSION_LIFETIME_SENT_MESSAGES = Histogram(
+        "session_lifetime_sent_messages",
+        "Messages sent over a session lifetime",
+        namespace=NAMESPACE,
+        buckets=MESSAGE_COUNT_BUCKETS,
+    )
+    SESSION_LIFETIME_RECEIVED_BYTES = Histogram(
+        "session_lifetime_received_bytes",
+        "Bytes received over a session lifetime",
+        namespace=NAMESPACE,
+        buckets=BYTE_BUCKETS,
+    )
+    SESSION_LIFETIME_RECEIVED_MESSAGES = Histogram(
+        "session_lifetime_received_messages",
+        "Messages received over a session lifetime",
+        namespace=NAMESPACE,
+        buckets=MESSAGE_COUNT_BUCKETS,
+    )
+    SESSION_DISCONNECTS = Counter(
+        "session_disconnects",
+        "Session disconnects by reason",
+        namespace=NAMESPACE,
+        labelnames=("reason",),
+    )
+    RESPONSE_SERIALIZATION_TIME = Histogram(
+        "response_serialization_seconds",
+        "JSON-RPC response serialization time",
+        namespace=NAMESPACE,
+        labelnames=("method",),
+        buckets=HISTOGRAM_BUCKETS,
+    )
+    RESPONSE_BYTES = Histogram(
+        "response_bytes",
+        "JSON-RPC response bytes",
+        namespace=NAMESPACE,
+        labelnames=("method",),
+        buckets=BYTE_BUCKETS,
+    )
+    RESPONSE_SIZE_METHODS = {
+        "blockchain.claimtrie.search",
+        "blockchain.claimtrie.resolve",
+        "blockchain.transaction.get_batch",
+    }
     max_errors = 10
 
     def __init__(self, session_manager: SessionManager, kind: str):
@@ -930,6 +1076,7 @@ class LBRYElectrumX(asyncio.Protocol):
         self.last_packet_received = self.start_time
         self.connection = connection or self.default_connection()
         self.client_version = "unknown"
+        self.disconnect_reason = "unknown"
 
         self.logger = logging.getLogger(__name__)
         self.session_manager = session_manager
@@ -946,6 +1093,7 @@ class LBRYElectrumX(asyncio.Protocol):
         self.subscribe_headers_raw = False
         self.subscribe_peers = False
         self.connection.max_response_size = self.env.max_send
+        self.connection.response_observer = self.observe_response_bytes
         self.hashX_subs = {}
         self.sv_seen = False
         self.protocol_tuple = self.PROTOCOL_MIN
@@ -954,6 +1102,10 @@ class LBRYElectrumX(asyncio.Protocol):
         self.daemon = self.session_manager.daemon
         self.db = self.session_manager.db
         self.mempool = self.session_manager.mempool
+
+    def observe_response_bytes(self, method, byte_count):
+        if method in self.RESPONSE_SIZE_METHODS:
+            self.RESPONSE_BYTES.labels(method=method).observe(byte_count)
 
     def data_received(self, framed_message):
         """Called by asyncio when a message comes in."""
@@ -1000,6 +1152,12 @@ class LBRYElectrumX(asyncio.Protocol):
 
     def connection_lost(self, exc):
         """Handle client disconnection."""
+        reason = self.disconnect_reason or "unknown"
+        self.SESSION_DISCONNECTS.labels(reason=reason).inc()
+        self.SESSION_LIFETIME_SENT_BYTES.observe(self.send_size)
+        self.SESSION_LIFETIME_SENT_MESSAGES.observe(self.send_count)
+        self.SESSION_LIFETIME_RECEIVED_BYTES.observe(self.recv_size)
+        self.SESSION_LIFETIME_RECEIVED_MESSAGES.observe(self.recv_count)
         self.connection.raise_pending_requests(exc)
         self._address = None
         self.transport = None
@@ -1127,7 +1285,7 @@ class LBRYElectrumX(asyncio.Protocol):
         try:
             await asyncio.wait_for(self._can_send.wait(), secs)
         except asyncio.TimeoutError:
-            self.abort()
+            self.abort(reason="send_timeout")
             raise asyncio.TimeoutError(f"task timed out after {secs}s")
 
     async def _send_message(self, message):
@@ -1146,9 +1304,14 @@ class LBRYElectrumX(asyncio.Protocol):
         self.errors += 1
         if self.errors >= self.max_errors:
             # Don't await self.close() because that is self-cancelling
-            self._close()
+            self._close(reason="reset")
 
-    def _close(self):
+    def _set_disconnect_reason(self, reason):
+        if self.disconnect_reason in ("unknown", "normal"):
+            self.disconnect_reason = reason
+
+    def _close(self, reason="normal"):
+        self._set_disconnect_reason(reason)
         if self.transport:
             self.transport.close()
 
@@ -1165,23 +1328,24 @@ class LBRYElectrumX(asyncio.Protocol):
         """Return True if the connection is closing."""
         return not self.transport or self.transport.is_closing()
 
-    def abort(self):
+    def abort(self, reason="reset"):
         """Forcefully close the connection."""
+        self._set_disconnect_reason(reason)
         if self.transport:
             self.transport.abort()
 
     # TODO: replace with synchronous_close
-    async def close(self, *, force_after=30):
+    async def close(self, *, force_after=30, reason="normal"):
         """Close the connection and return when closed."""
-        self._close()
+        self._close(reason=reason)
         if self._pm_task:
             with suppress(asyncio.CancelledError):
                 await asyncio.wait([self._pm_task], timeout=force_after)
-                self.abort()
+                self.abort(reason=reason)
                 await self._pm_task
 
-    def synchronous_close(self):
-        self._close()
+    def synchronous_close(self, reason="normal"):
+        self._close(reason=reason)
         if self._pm_task and not self._pm_task.done():
             self._pm_task.cancel()
 
@@ -1196,7 +1360,7 @@ class LBRYElectrumX(asyncio.Protocol):
                     self._address[1],
                 )
                 self.RESET_CONNECTIONS.labels(version=self.client_version).inc()
-                self._close()
+                self._close(reason="reset")
                 return
 
             self.last_recv = time.perf_counter()
@@ -1228,7 +1392,12 @@ class LBRYElectrumX(asyncio.Protocol):
             self.logger.exception(f"exception handling {reqstr[:16_000]}")
             result = RPCError(JSONRPC.INTERNAL_ERROR, "internal server error")
         if isinstance(request, Request):
+            serialize_start = time.perf_counter()
             message = request.send_result(result)
+            if request.method in self.RESPONSE_SIZE_METHODS:
+                self.RESPONSE_SERIALIZATION_TIME.labels(method=request.method).observe(
+                    time.perf_counter() - serialize_start
+                )
             self.RESPONSE_TIMES.labels(method=request.method).observe(
                 time.perf_counter() - start
             )
@@ -1270,7 +1439,7 @@ class LBRYElectrumX(asyncio.Protocol):
             self.logger.info(
                 f"timeout sending address notification to {self._address[0]}:{self._address[1]}"
             )
-            self.abort()
+            self.abort(reason="send_timeout")
             return False
 
     def send_notification(self, method, args=()):
@@ -1286,7 +1455,7 @@ class LBRYElectrumX(asyncio.Protocol):
             self.logger.info(
                 f"timeout sending address notification to {self._address[0]}:{self._address[1]}"
             )
-            self.abort()
+            self.abort(reason="send_timeout")
             return False
 
     def send_batch(self, raise_errors=False):
@@ -1441,33 +1610,45 @@ class LBRYElectrumX(asyncio.Protocol):
 
     async def claimtrie_search(self, **kwargs):
         start = time.perf_counter()
-        if "release_time" in kwargs:
-            release_time = kwargs.pop("release_time")
-            release_times = (
-                release_time if isinstance(release_time, list) else [release_time]
-            )
-            try:
-                kwargs["release_time"] = [
-                    format_release_time(release_time) for release_time in release_times
-                ]
-            except ValueError as e:
-                # Log invalid release_time and return error to client
-                self.logger.warning(
-                    "Invalid release_time parameter from %s: %s",
-                    self.peer_address()[0] if self.peer_address() else "unknown",
-                    str(e),
-                )
-                raise RPCError(BAD_REQUEST, f"invalid release_time parameter: {str(e)}")
+        pending_inc = False
         try:
+            if "release_time" in kwargs:
+                phase_start = time.perf_counter()
+                release_time = kwargs.pop("release_time")
+                release_times = (
+                    release_time if isinstance(release_time, list) else [release_time]
+                )
+                try:
+                    kwargs["release_time"] = [
+                        format_release_time(release_time) for release_time in release_times
+                    ]
+                except ValueError as e:
+                    self.logger.warning(
+                        "Invalid release_time parameter from %s: %s",
+                        self.peer_address()[0] if self.peer_address() else "unknown",
+                        str(e),
+                    )
+                    raise RPCError(BAD_REQUEST, f"invalid release_time parameter: {str(e)}")
+                finally:
+                    search_phase_seconds.labels(phase="release_time_parse").observe(
+                        time.perf_counter() - phase_start
+                    )
             self.session_manager.pending_query_metric.inc()
+            pending_inc = True
             if "channel" in kwargs:
+                phase_start = time.perf_counter()
                 channel_url = kwargs.pop("channel")
-                _, channel_claim, _, _ = await self.db.resolve(channel_url)
-                if not channel_claim or isinstance(
-                    channel_claim, (ResolveCensoredError, LookupError, ValueError)
-                ):
-                    return Outputs.to_base64([], [])
-                kwargs["channel_id"] = channel_claim.claim_hash.hex()
+                try:
+                    _, channel_claim, _, _ = await self.db.resolve(channel_url)
+                    if not channel_claim or isinstance(
+                        channel_claim, (ResolveCensoredError, LookupError, ValueError)
+                    ):
+                        return Outputs.to_base64([], [])
+                    kwargs["channel_id"] = channel_claim.claim_hash.hex()
+                finally:
+                    search_phase_seconds.labels(phase="channel_resolve").observe(
+                        time.perf_counter() - phase_start
+                    )
             return await self.session_manager.search_index.cached_search(kwargs)
         except ConnectionTimeout:
             self.session_manager.search_index.timeout_counter.inc()
@@ -1482,8 +1663,12 @@ class LBRYElectrumX(asyncio.Protocol):
             )
             return RPCError(1, str(err))
         finally:
-            self.session_manager.pending_query_metric.dec()
+            if pending_inc:
+                self.session_manager.pending_query_metric.dec()
             self.session_manager.executor_time_metric.observe(
+                time.perf_counter() - start
+            )
+            search_phase_seconds.labels(phase="total").observe(
                 time.perf_counter() - start
             )
 

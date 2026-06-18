@@ -3,6 +3,7 @@ import asyncio
 import typing
 import signal
 from concurrent.futures.thread import ThreadPoolExecutor
+from contextlib import suppress
 from prometheus_client import Gauge, Histogram
 
 from hub import __version__, PROMETHEUS_NAMESPACE
@@ -31,6 +32,7 @@ class BlockchainService:
         self.secondary_name = secondary_name
         self._stopping = False
         self.prometheus_server: typing.Optional[PrometheusServer] = None
+        self._db_metrics_task = None
         self.db = None
         self.open_db()
 
@@ -47,11 +49,26 @@ class BlockchainService:
         if not self.prometheus_server and self.env.prometheus_port:
             self.prometheus_server = PrometheusServer()
             await self.prometheus_server.start("0.0.0.0", self.env.prometheus_port)
+            self._db_metrics_task = asyncio.ensure_future(self._snapshot_db_metrics_forever())
 
     async def stop_prometheus(self):
+        if self._db_metrics_task and not self._db_metrics_task.done():
+            self._db_metrics_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._db_metrics_task
+        self._db_metrics_task = None
         if self.prometheus_server:
             await self.prometheus_server.stop()
             self.prometheus_server = None
+
+    async def _snapshot_db_metrics_forever(self):
+        while True:
+            try:
+                if self.db and self.db.prefix_db:
+                    self.db.prefix_db.snapshot_rocksdb_metrics()
+            except Exception:
+                self.log.debug("failed to snapshot rocksdb metrics", exc_info=True)
+            await asyncio.sleep(30)
 
     def start_cancellable(self, run, *args):
         _flag = asyncio.Event()

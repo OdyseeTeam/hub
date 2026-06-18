@@ -4,15 +4,19 @@ import json
 import os
 import typing
 from collections import defaultdict
-from time import time
+from time import perf_counter, time
 
 from elasticsearch import AsyncElasticsearch, ConnectionError, NotFoundError
 from elasticsearch.helpers import async_streaming_bulk
+from prometheus_client import Counter, Gauge, Histogram
 
+from hub import PROMETHEUS_NAMESPACE
 from hub.common import (
     ALL_FIELDS,
+    HISTOGRAM_BUCKETS,
     INDEX_DEFAULT_SETTINGS,
     IndexVersionMismatch,
+    SIZE_BUCKETS,
     expand_query,
 )
 from hub.db.common import DB_PREFIXES, ResolveResult, TrendingNotification
@@ -26,6 +30,65 @@ from hub.service import BlockchainReaderService
 
 if typing.TYPE_CHECKING:
     from hub.elastic_sync.env import ElasticEnv
+
+
+NAMESPACE = f"{PROMETHEUS_NAMESPACE}_elastic_sync"
+last_synced_height_metric = Gauge(
+    "last_synced_height",
+    "Last height written to Elasticsearch",
+    namespace=NAMESPACE,
+)
+db_height_metric = Gauge(
+    "db_height",
+    "Current RocksDB height seen by elastic sync",
+    namespace=NAMESPACE,
+)
+lag_blocks_metric = Gauge(
+    "lag_blocks",
+    "RocksDB height minus last Elasticsearch synced height",
+    namespace=NAMESPACE,
+)
+bulk_items_metric = Counter(
+    "bulk_items",
+    "Elasticsearch bulk items by operation",
+    namespace=NAMESPACE,
+    labelnames=("operation",),
+)
+bulk_failures_metric = Counter(
+    "bulk_failures",
+    "Elasticsearch bulk item failures by operation",
+    namespace=NAMESPACE,
+    labelnames=("operation",),
+)
+bulk_seconds_metric = Histogram(
+    "bulk_seconds",
+    "Elasticsearch bulk write time by operation",
+    namespace=NAMESPACE,
+    labelnames=("operation",),
+    buckets=HISTOGRAM_BUCKETS,
+)
+claim_producer_batch_size_metric = Histogram(
+    "claim_producer_batch_size",
+    "Claim producer batch size",
+    namespace=NAMESPACE,
+    buckets=SIZE_BUCKETS,
+)
+mempool_refresh_seconds_metric = Histogram(
+    "mempool_refresh_seconds",
+    "Mempool overlay refresh time",
+    namespace=NAMESPACE,
+    buckets=HISTOGRAM_BUCKETS,
+)
+mempool_changed_metric = Counter(
+    "mempool_changed",
+    "Mempool overlay refreshes that changed indexed data",
+    namespace=NAMESPACE,
+)
+notifier_clients_metric = Gauge(
+    "notifier_clients",
+    "Current elastic notifier client count",
+    namespace=NAMESPACE,
+)
 
 
 class ElasticSyncService(BlockchainReaderService):
@@ -117,9 +180,26 @@ class ElasticSyncService(BlockchainReaderService):
             await server.serve_forever()
 
     def notify_es_notification_listeners(self, height: int, block_hash: bytes):
+        notifier_clients_metric.set(len(self._listeners))
         for p in self._listeners:
             p.send_height(height, block_hash)
             self.log.info("notify listener %i", height)
+
+    def update_metrics(self):
+        db_height = self.db.db_height if self.db else 0
+        last_height = self.last_synced_height
+        last_synced_height_metric.set(last_height)
+        db_height_metric.set(db_height)
+        lag_blocks_metric.set(max(0, db_height - last_height))
+        notifier_clients_metric.set(len(self._listeners))
+
+    def record_bulk_item(self, operation, ok):
+        bulk_items_metric.labels(operation=operation).inc()
+        if not ok:
+            bulk_failures_metric.labels(operation=operation).inc()
+
+    def record_bulk_seconds(self, operation, seconds):
+        bulk_seconds_metric.labels(operation=operation).observe(seconds)
 
     def _read_es_height(self):
         info = {}
@@ -323,6 +403,7 @@ class ElasticSyncService(BlockchainReaderService):
 
         for idx in range(0, len(touched_claims), 1000):
             batch = touched_claims[idx : idx + 1000]
+            claim_producer_batch_size_metric.observe(len(batch))
             claims = {}
             total_extras = {}
             async for claim_hash, claim, extras in self.db._prepare_resolve_results(
@@ -380,78 +461,84 @@ class ElasticSyncService(BlockchainReaderService):
             yield self._upsert_claim_query(self.mempool_index, claim)
 
     async def refresh_mempool_index(self):
+        start = perf_counter()
         changed = await asyncio.get_event_loop().run_in_executor(
             self._executor, self._refresh_pending_claims
         )
-        if not changed:
-            return
-        await self.sync_client.indices.create(
-            self.mempool_index, INDEX_DEFAULT_SETTINGS, ignore=400
-        )
-        previous_claim_hashes = self._mempool_claim_hashes
-        current_claim_hashes = set(self._pending_claims.claims_by_hash)
-        deleted_claims = previous_claim_hashes.difference(current_claim_hashes)
-        if not deleted_claims and not current_claim_hashes:
-            self._mempool_claim_hashes = current_claim_hashes
-            self._mempool_claim_docs.clear()
-            return
-        current_docs = {}
-        async for claim in self.db.prepare_pending_claim_metadata_batch(
-            self._pending_claims,
-            pending_tx_timestamps=self._mempool_tx_timestamps,
-        ):
-            if claim:
-                current_docs[bytes.fromhex(claim["claim_id"])] = claim
-        # tx_num is a virtual sequential number that shifts whenever a new
-        # mempool tx sorts between existing ones — exclude it from the delta
-        # comparison so we don't rewrite every doc on each new tx arrival.
-        _VOLATILE_FIELDS = {"tx_num"}
-
-        def _doc_changed(claim_hash, new_doc):
-            old_doc = self._mempool_claim_docs.get(claim_hash)
-            if old_doc is None:
-                return True
-            return any(
-                new_doc.get(k) != old_doc.get(k)
-                for k in set(new_doc) | set(old_doc)
-                if k not in _VOLATILE_FIELDS
-            )
-
-        updated_claims = {
-            claim_hash: claim
-            for claim_hash, claim in current_docs.items()
-            if _doc_changed(claim_hash, claim)
-        }
-        self._mempool_claim_hashes = current_claim_hashes
-        if not deleted_claims and not updated_claims:
-            self._mempool_claim_docs = current_docs
-            return
-        cnt = 0
-        success = 0
-        async for ok, item in async_streaming_bulk(
-            self.sync_client,
-            self._mempool_claim_producer(deleted_claims, updated_claims),
-            raise_on_error=False,
-        ):
-            cnt += 1
-            if not ok:
-                self.log.warning("mempool indexing failed for an item: %s", item)
-            else:
-                success += 1
-        self._mempool_claim_docs = current_docs
         try:
-            await self.sync_client.indices.refresh(self.mempool_index)
-        except NotFoundError:
+            if not changed:
+                return
             await self.sync_client.indices.create(
                 self.mempool_index, INDEX_DEFAULT_SETTINGS, ignore=400
             )
-            await self.sync_client.indices.refresh(self.mempool_index)
-        self.log.info(
-            "Indexed mempool overlay claims. %i/%i successful, %i pending claims",
-            success,
-            cnt,
-            len(current_claim_hashes),
-        )
+            previous_claim_hashes = self._mempool_claim_hashes
+            current_claim_hashes = set(self._pending_claims.claims_by_hash)
+            deleted_claims = previous_claim_hashes.difference(current_claim_hashes)
+            if not deleted_claims and not current_claim_hashes:
+                self._mempool_claim_hashes = current_claim_hashes
+                self._mempool_claim_docs.clear()
+                return
+            current_docs = {}
+            async for claim in self.db.prepare_pending_claim_metadata_batch(
+                self._pending_claims,
+                pending_tx_timestamps=self._mempool_tx_timestamps,
+            ):
+                if claim:
+                    current_docs[bytes.fromhex(claim["claim_id"])] = claim
+            _VOLATILE_FIELDS = {"tx_num"}
+
+            def _doc_changed(claim_hash, new_doc):
+                old_doc = self._mempool_claim_docs.get(claim_hash)
+                if old_doc is None:
+                    return True
+                return any(
+                    new_doc.get(k) != old_doc.get(k)
+                    for k in set(new_doc) | set(old_doc)
+                    if k not in _VOLATILE_FIELDS
+                )
+
+            updated_claims = {
+                claim_hash: claim
+                for claim_hash, claim in current_docs.items()
+                if _doc_changed(claim_hash, claim)
+            }
+            self._mempool_claim_hashes = current_claim_hashes
+            if not deleted_claims and not updated_claims:
+                self._mempool_claim_docs = current_docs
+                return
+            cnt = 0
+            success = 0
+            bulk_start = perf_counter()
+            async for ok, item in async_streaming_bulk(
+                self.sync_client,
+                self._mempool_claim_producer(deleted_claims, updated_claims),
+                raise_on_error=False,
+            ):
+                cnt += 1
+                self.record_bulk_item("mempool", ok)
+                if not ok:
+                    self.log.warning("mempool indexing failed for an item: %s", item)
+                else:
+                    success += 1
+            self.record_bulk_seconds("mempool", perf_counter() - bulk_start)
+            self._mempool_claim_docs = current_docs
+            try:
+                await self.sync_client.indices.refresh(self.mempool_index)
+            except NotFoundError:
+                await self.sync_client.indices.create(
+                    self.mempool_index, INDEX_DEFAULT_SETTINGS, ignore=400
+                )
+                await self.sync_client.indices.refresh(self.mempool_index)
+            if success:
+                mempool_changed_metric.inc()
+            self.log.info(
+                "Indexed mempool overlay claims. %i/%i successful, %i pending claims",
+                success,
+                cnt,
+                len(current_claim_hashes),
+            )
+        finally:
+            mempool_refresh_seconds_metric.observe(perf_counter() - start)
 
     def advance(self, height: int):
         super().advance(height)
@@ -516,14 +603,17 @@ class ElasticSyncService(BlockchainReaderService):
         success = 0
         if self._advanced:
             if self._touched_claims or self._deleted_claims or self._trending:
+                bulk_start = perf_counter()
                 async for ok, item in async_streaming_bulk(
                     self.sync_client, self._claim_producer(), raise_on_error=False
                 ):
                     cnt += 1
+                    self.record_bulk_item("block", ok)
                     if not ok:
                         self.log.warning("indexing failed for an item: %s", item)
                     else:
                         success += 1
+                self.record_bulk_seconds("block", perf_counter() - bulk_start)
                 await self.sync_client.indices.refresh(self.index)
                 await self.apply_filters(
                     self.db.blocked_streams,
@@ -548,6 +638,7 @@ class ElasticSyncService(BlockchainReaderService):
                 self._last_wrote_height, self.db.db_tip
             )
         await self.refresh_mempool_index()
+        self.update_metrics()
 
     @property
     def last_synced_height(self) -> int:
@@ -576,14 +667,17 @@ class ElasticSyncService(BlockchainReaderService):
         success = 0
         cnt = 0
         if self._touched_claims or self._deleted_claims or self._trending:
+            bulk_start = perf_counter()
             async for ok, item in async_streaming_bulk(
                 self.sync_client, self._claim_producer(), raise_on_error=False
             ):
                 cnt += 1
+                self.record_bulk_item("catch_up", ok)
                 if not ok:
                     self.log.warning("indexing failed for an item: %s", item)
                 else:
                     success += 1
+            self.record_bulk_seconds("catch_up", perf_counter() - bulk_start)
             await self.sync_client.indices.refresh(self.index)
             await self.apply_filters(
                 self.db.blocked_streams,
@@ -598,6 +692,7 @@ class ElasticSyncService(BlockchainReaderService):
         self._trending.clear()
         self._advanced = False
         self.notify_es_notification_listeners(self._last_wrote_height, last_state.tip)
+        self.update_metrics()
         self.log.info(
             "Indexing block %i done. %i/%i successful",
             self._last_wrote_height,
@@ -642,14 +737,16 @@ class ElasticSyncService(BlockchainReaderService):
         yield self.block_bulk_sync_on_writer_catchup()
         yield self.read_es_height()
         yield self.start_index()
+        yield self.start_prometheus()
+        self.update_metrics()
         yield self.start_cancellable(self.run_es_notifier)
         yield self.reindex(force=self._force_reindex)
         yield self.catch_up()
         self.block_count_metric.set(self.last_state.height)
-        yield self.start_prometheus()
         yield self.start_cancellable(self.refresh_blocks_forever)
 
     def _iter_stop_tasks(self):
+        yield self.stop_prometheus()
         yield self._stop_cancellable_tasks()
         yield self.stop_index()
 
@@ -683,6 +780,7 @@ class ElasticSyncService(BlockchainReaderService):
             await self.sync_client.indices.refresh(self.index)
             await self.sync_client.indices.refresh(self.mempool_index)
             self.write_es_height(0, self.env.coin.GENESIS_HASH)
+            self.update_metrics()
             await self._sync_all_claims()
             self._mempool_claim_hashes.clear()
             self._mempool_claim_docs.clear()
@@ -691,6 +789,7 @@ class ElasticSyncService(BlockchainReaderService):
             self._last_mempool_height = -1
             await self.sync_client.indices.refresh(self.index)
             self.write_es_height(self.db.db_height, self.db.db_tip[::-1].hex())
+            self.update_metrics()
             self.notify_es_notification_listeners(self.db.db_height, self.db.db_tip)
             self.log.info("finished reindexing")
 
@@ -727,10 +826,12 @@ class ElasticSyncService(BlockchainReaderService):
 
         finished = False
         try:
+            bulk_start = perf_counter()
             async for ok, item in async_streaming_bulk(
                 self.sync_client, producer, raise_on_error=False
             ):
                 cnt += 1
+                self.record_bulk_item("reindex", ok)
                 if not ok:
                     self.log.warning("indexing failed for an item: %s", item)
                 else:
@@ -738,6 +839,7 @@ class ElasticSyncService(BlockchainReaderService):
                 if cnt % batch_size == 0:
                     self.log.info(f"indexed {success}/{cnt} claims")
             finished = True
+            self.record_bulk_seconds("reindex", perf_counter() - bulk_start)
             await self.sync_client.indices.refresh(self.index)
             self.log.info("indexed %i/%i claims", success, cnt)
         finally:

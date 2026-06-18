@@ -3,11 +3,48 @@ import struct
 import typing
 import rocksdb
 from typing import Optional
+from prometheus_client import Gauge
+from hub import PROMETHEUS_NAMESPACE
 from hub.db.common import DB_PREFIXES, COLUMN_SETTINGS
 from hub.db.revertable import RevertableOpStack, RevertablePut, RevertableDelete
 
 
 ROW_TYPES = {}
+NAMESPACE = f"{PROMETHEUS_NAMESPACE}_db"
+ROCKSDB_PROPERTY_BYTES = (
+    "estimate-table-readers-mem",
+    "cur-size-active-mem-table",
+    "cur-size-all-mem-tables",
+    "size-all-mem-tables",
+    "block-cache-usage",
+    "block-cache-pinned-usage",
+)
+ROCKSDB_PROPERTY_COUNTS = ("estimate-num-keys",)
+ROCKSDB_PROPERTY_BYTES_METRIC = Gauge(
+    "rocksdb_property_bytes",
+    "RocksDB memory-like properties by column family",
+    namespace=NAMESPACE,
+    labelnames=("property", "column_family"),
+)
+ROCKSDB_PROPERTY_COUNT_METRIC = Gauge(
+    "rocksdb_property_count",
+    "RocksDB count-like properties by column family",
+    namespace=NAMESPACE,
+    labelnames=("property", "column_family"),
+)
+ROCKSDB_CONFIGURED_BLOCK_CACHE_BYTES = Gauge(
+    "rocksdb_configured_block_cache_bytes",
+    "Configured RocksDB block cache size by column family",
+    namespace=NAMESPACE,
+    labelnames=("column_family",),
+)
+
+
+def _remove_metric_label(metric, *labels):
+    try:
+        metric.remove(*labels)
+    except KeyError:
+        pass
 
 
 class PrefixRowType(type):
@@ -186,8 +223,12 @@ class BasePrefixDB:
     def __init__(self, path, max_open_files=64, secondary_path='', max_undo_depth: int = 200, unsafe_prefixes=None,
                  enforce_integrity=True):
         column_family_options = {}
+        self._column_family_labels = {}
+        self._block_cache_sizes = {}
         for prefix in DB_PREFIXES:
             settings = COLUMN_SETTINGS[prefix.value]
+            self._column_family_labels[prefix.value] = prefix.name
+            self._block_cache_sizes[prefix.value] = settings['cache_size']
             column_family_options[prefix.value] = rocksdb.ColumnFamilyOptions()
             column_family_options[prefix.value].table_factory = rocksdb.BlockBasedTableFactory(
                 block_cache=rocksdb.LRUCache(settings['cache_size'])
@@ -322,6 +363,47 @@ class BasePrefixDB:
 
     def close(self):
         self._db.close()
+
+    def _get_property_int(self, property_name, column_family):
+        try:
+            value = self._db.get_property(f"rocksdb.{property_name}".encode(), column_family)
+        except Exception:
+            return
+        if value is None:
+            return
+        if isinstance(value, bytes):
+            value = value.decode()
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return
+
+    def snapshot_rocksdb_metrics(self):
+        for prefix, column_family in self.column_families.items():
+            label = self._column_family_labels[prefix]
+            ROCKSDB_CONFIGURED_BLOCK_CACHE_BYTES.labels(column_family=label).set(
+                self._block_cache_sizes[prefix]
+            )
+            for property_name in ROCKSDB_PROPERTY_BYTES:
+                value = self._get_property_int(property_name, column_family)
+                if value is not None:
+                    ROCKSDB_PROPERTY_BYTES_METRIC.labels(
+                        property=property_name, column_family=label
+                    ).set(value)
+                else:
+                    _remove_metric_label(
+                        ROCKSDB_PROPERTY_BYTES_METRIC, property_name, label
+                    )
+            for property_name in ROCKSDB_PROPERTY_COUNTS:
+                value = self._get_property_int(property_name, column_family)
+                if value is not None:
+                    ROCKSDB_PROPERTY_COUNT_METRIC.labels(
+                        property=property_name, column_family=label
+                    ).set(value)
+                else:
+                    _remove_metric_label(
+                        ROCKSDB_PROPERTY_COUNT_METRIC, property_name, label
+                    )
 
     def try_catch_up_with_primary(self):
         self._db.try_catch_up_with_primary()

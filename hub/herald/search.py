@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from bisect import bisect_right
 from collections import Counter, deque
 from operator import itemgetter
@@ -15,6 +16,7 @@ from hub.common import (
     INDEX_DEFAULT_SETTINGS,
     IndexVersionMismatch,
     LRUCache,
+    SIZE_BUCKETS,
     expand_query,
     expand_result,
     register_cache_metrics,
@@ -45,6 +47,31 @@ herald_search_cache_hit = PrometheusCounter(
     "Herald search-path cache checks by layer and hit/miss result",
     namespace=NAMESPACE,
     labelnames=("layer", "result"),
+)
+search_phase_seconds = Histogram(
+    "search_phase_seconds",
+    "Reader-side search request phase timings",
+    namespace=NAMESPACE,
+    labelnames=("phase",),
+    buckets=HISTOGRAM_BUCKETS,
+)
+search_es_hits = Histogram(
+    "search_es_hits",
+    "Elasticsearch hit count per search miss",
+    namespace=NAMESPACE,
+    buckets=SIZE_BUCKETS,
+)
+search_reordered_hits = Histogram(
+    "search_reordered_hits",
+    "Reordered hit count per search response",
+    namespace=NAMESPACE,
+    buckets=SIZE_BUCKETS,
+)
+search_returned_claims = Histogram(
+    "search_returned_claims",
+    "Returned claim count per search response",
+    namespace=NAMESPACE,
+    buckets=SIZE_BUCKETS,
 )
 
 
@@ -90,6 +117,11 @@ class SearchIndex:
         register_cache_metrics("search_results", self.search_cache, NAMESPACE)
         self._elastic_services = elastic_services
         self.lost_connection = asyncio.Event()
+
+    @staticmethod
+    def _observe_returned_claims(cache_item):
+        if cache_item.result_count is not None:
+            search_returned_claims.observe(cache_item.result_count)
 
     async def get_index_version(self) -> int:
         try:
@@ -215,10 +247,12 @@ class SearchIndex:
         cache_item = ResultCacheItem.from_cache(str(kwargs), self.search_cache)
         if cache_item.result is not None:
             herald_search_cache_hit.labels(layer="cached_search", result="hit").inc()
+            self._observe_returned_claims(cache_item)
             return cache_item.result
         async with cache_item.lock:
             if cache_item.result is not None:
                 herald_search_cache_hit.labels(layer="cached_search", result="hit").inc()
+                self._observe_returned_claims(cache_item)
                 return cache_item.result
             herald_search_cache_hit.labels(layer="cached_search", result="miss").inc()
             response, offset, total = await self.search(**kwargs)
@@ -272,6 +306,9 @@ class SearchIndex:
                         row for row in pending_extra if row.claim_hash not in seen_extra
                     )
             result = Outputs.to_base64(response, extra, offset, total, censored)
+            result_count = len(response)
+            search_returned_claims.observe(result_count)
+            cache_item.result_count = result_count
             cache_item.result = result
             return result
 
@@ -319,10 +356,15 @@ class SearchIndex:
                     reordered_hits = cache_item.result
                 else:
                     herald_search_cache_hit.labels(layer="search_ahead", result="miss").inc()
+                    phase_start = time.perf_counter()
                     query = expand_query(**kwargs)
+                    search_phase_seconds.labels(phase="expand_query").observe(
+                        time.perf_counter() - phase_start
+                    )
                     herald_expand_query_path.labels(
                         path="filter" if query.get("sort") else "must_fallback"
                     ).inc()
+                    phase_start = time.perf_counter()
                     es_resp = await self.search_client.search(
                         query,
                         index=self.index,
@@ -335,14 +377,23 @@ class SearchIndex:
                             "creation_height",
                         ],
                     )
+                    search_phase_seconds.labels(phase="elasticsearch_request").observe(
+                        time.perf_counter() - phase_start
+                    )
                     es_took_ms = es_resp.get("took")
                     if es_took_ms is not None:
                         es_search_took_seconds.observe(es_took_ms / 1000.0)
                     search_hits = deque(es_resp["hits"]["hits"])
+                    search_es_hits.observe(len(search_hits))
                     if self.timeout_counter and es_resp["timed_out"]:
                         self.timeout_counter.inc()
+                    phase_start = time.perf_counter()
                     if remove_duplicates:
                         search_hits = self.__remove_duplicates(search_hits)
+                    search_phase_seconds.labels(phase="dedupe").observe(
+                        time.perf_counter() - phase_start
+                    )
+                    phase_start = time.perf_counter()
                     if per_channel_per_page > 0:
                         reordered_hits = self.__search_ahead(
                             search_hits, page_size, per_channel_per_page
@@ -352,7 +403,12 @@ class SearchIndex:
                             (hit["_id"], hit["_source"]["channel_id"])
                             for hit in search_hits
                         ]
+                    search_phase_seconds.labels(phase="reorder").observe(
+                        time.perf_counter() - phase_start
+                    )
                     cache_item.result = reordered_hits
+        search_reordered_hits.observe(len(reordered_hits))
+        phase_start = time.perf_counter()
         result = list(
             await self.get_many(
                 *(
@@ -360,6 +416,9 @@ class SearchIndex:
                     for claim_id, _ in reordered_hits[offset : (offset + page_size)]
                 )
             )
+        )
+        search_phase_seconds.labels(phase="hydrate_claims").observe(
+            time.perf_counter() - phase_start
         )
         return result, 0, len(reordered_hits)
 
@@ -445,12 +504,13 @@ class SearchIndex:
 
 
 class ResultCacheItem:
-    __slots__ = "_result", "lock", "has_result"
+    __slots__ = "_result", "lock", "has_result", "result_count"
 
     def __init__(self):
         self.has_result = asyncio.Event()
         self.lock = asyncio.Lock()
         self._result = None
+        self.result_count = None
 
     @property
     def result(self) -> str:

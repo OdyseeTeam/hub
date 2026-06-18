@@ -462,6 +462,7 @@ class JSONRPCConnection:
         self._requests: typing.Dict[str, typing.Tuple[Request, ResultEvent]] = {}
         # A public attribute intended to be settable dynamically
         self.max_response_size = 0
+        self.response_observer = None
 
     def _oversized_response_message(self, request_id):
         text = f'response too large (over {self.max_response_size:,d} bytes'
@@ -481,12 +482,14 @@ class JSONRPCConnection:
         return []
 
     def _receive_request_batch(self, payloads):
-        def item_send_result(request_id, result):
+        def item_send_result(request, request_id, result):
             nonlocal size
             part = protocol.response_message(result, request_id)
             size += len(part) + 2
             if size > self.max_response_size > 0:
                 part = self._oversized_response_message(request_id)
+            if self.response_observer:
+                self.response_observer(request.method, len(part) + 2)
             parts.append(part)
             if len(parts) == count:
                 return protocol.batch_message_from_parts(parts)
@@ -503,7 +506,7 @@ class JSONRPCConnection:
                 items.append(item)
                 if isinstance(item, Request):
                     count += 1
-                    item.send_result = partial(item_send_result, request_id)
+                    item.send_result = partial(item_send_result, item, request_id)
             except ProtocolError as error:
                 count += 1
                 parts.append(error.error_message)
@@ -532,10 +535,12 @@ class JSONRPCConnection:
         event.set()
         return []
 
-    def _send_result(self, request_id, result):
+    def _send_result(self, request, request_id, result):
         message = self._protocol.response_message(result, request_id)
         if len(message) > self.max_response_size > 0:
             message = self._oversized_response_message(request_id)
+        if self.response_observer:
+            self.response_observer(request.method, len(message) + 1)
         return message
 
     def _event(self, request, request_id):
@@ -586,7 +591,7 @@ class JSONRPCConnection:
             raise
 
         if isinstance(item, Request):
-            item.send_result = partial(self._send_result, request_id)
+            item.send_result = partial(self._send_result, item, request_id)
             return [item]
         if isinstance(item, Notification):
             return [item]
